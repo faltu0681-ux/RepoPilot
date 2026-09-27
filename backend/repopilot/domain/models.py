@@ -59,6 +59,9 @@ class EventType(StrEnum):
     STEP_COMPLETED = "step.completed"
     STEP_FAILED = "step.failed"
     LOG = "log"
+    # Phase 2. Discovery and planning facts, streamed so the terminal can render them.
+    FILE_SELECTED = "file.selected"
+    PLAN_CREATED = "plan.created"
 
 
 class EventLevel(StrEnum):

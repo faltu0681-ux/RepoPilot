@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 
+from repopilot.agent.llm import ChatClient, build_chat_client
 from repopilot.config import Settings
 from repopilot.core.errors import NotFoundError
 from repopilot.domain.models import (
@@ -51,6 +52,7 @@ class RunEngine:
         bus: EventBus,
         settings: Settings,
         github: GitHubClient | None = None,
+        llm: ChatClient | None = None,
         steps: tuple[Step, ...] | None = None,
     ) -> None:
         self._store = store
@@ -60,6 +62,10 @@ class RunEngine:
             token=settings.github_token.get_secret_value() if settings.github_token else None,
             api_url=settings.github_api_url,
         )
+        # ``None`` means "not supplied", so an unconfigured install builds no client and makes
+        # no network call. A caller that wants no model at all relies on that, by configuring
+        # Settings without a model; there is no way to force ``None`` past this line.
+        self._llm = llm if llm is not None else build_chat_client(settings)
         self._steps = steps if steps is not None else default_pipeline()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancelled: set[str] = set()
@@ -79,6 +85,10 @@ class RunEngine:
     @property
     def github(self) -> GitHubClient:
         return self._github
+
+    @property
+    def llm(self) -> ChatClient | None:
+        return self._llm
 
     @property
     def active_runs(self) -> list[str]:
@@ -138,7 +148,7 @@ class RunEngine:
             await asyncio.wait_for(asyncio.shield(task), seconds)
 
     async def shutdown(self) -> None:
-        """Cancel every in-flight run and release the GitHub client."""
+        """Cancel every in-flight run and release the HTTP clients."""
         for run_id in list(self._tasks):
             self._cancelled.add(run_id)
             with contextlib.suppress(Exception):
@@ -150,6 +160,8 @@ class RunEngine:
         self._tasks.clear()
         await self._bus.shutdown()
         await self._github.aclose()
+        if self._llm is not None:
+            await self._llm.aclose()
 
     # ----------------------------------------------------------------- private
 
@@ -206,7 +218,9 @@ class RunEngine:
         """Execute every step in order. Returns the outcome and a human-readable reason."""
         run = await self._store.require_run(run_id)
         services = RunServices(
-            github=self._github, workspace=self._settings.workspace_dir.resolve()
+            github=self._github,
+            workspace=self._settings.workspace_dir.resolve(),
+            llm=self._llm,
         )
         state: dict = {}
         reason = "pipeline completed"

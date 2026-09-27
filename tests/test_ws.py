@@ -294,9 +294,53 @@ class TestLiveDelivery:
             )
             payload = read_until(ws, of_kind("bye"))
 
-        assert payload[-2]["type"] == "event"
-        assert payload[-2]["event"]["type"] == "run.finished"
+        # The final event alone does not say how the run ended, so the authoritative status is
+        # read back from the store and sent immediately before the goodbye.
+        assert payload[-3]["type"] == "event"
+        assert payload[-3]["event"]["type"] == "run.finished"
+        assert payload[-2] == {
+            "type": "status",
+            "run_id": run_id,
+            "status": "succeeded",
+        }
         assert payload[-1] == {"type": "bye", "reason": "run finished"}
+
+    def test_a_run_scoped_socket_reports_a_failure_it_attaches_to_late(
+        self, client: TestClient, stub_engine: None
+    ) -> None:
+        """A run that finished before the socket opened still has to say so, once, and close.
+
+        Its terminal status was published before this subscriber existed, so the bus will never
+        deliver it. Without reading it back from the store the client waits forever on a queue
+        that can only ever be empty.
+        """
+        run_id = make_run(client)
+        client.portal.call(terminate, client.app.state.store, run_id, RunStatus.FAILED)
+
+        with client.websocket_connect(f"{WS}?run_id={run_id}") as ws:
+            payload = read_until(ws, of_kind("bye"))
+
+        assert payload[-2] == {
+            "type": "status",
+            "run_id": run_id,
+            "status": "failed",
+        }
+        assert payload[-1] == {"type": "bye", "reason": "run already finished"}
+
+    def test_attaching_to_a_live_run_waits_for_it_to_finish(
+        self, client: TestClient, stub_engine: None
+    ) -> None:
+        """The already-finished shortcut must not close a socket that attached in time."""
+        run_id = make_run(client)
+
+        with client.websocket_connect(f"{WS}?run_id={run_id}") as ws:
+            client.portal.call(
+                publish, client.app.state.store, client.app.state.bus, run_id, "still working"
+            )
+            payload = read_until(ws, saying("still working"))
+
+        assert not any(frame["type"] == "bye" for frame in payload)
+        assert payload[0]["type"] == "hello"
 
     def test_a_terminal_status_also_closes_a_scoped_stream(
         self, client: TestClient, stub_engine: None

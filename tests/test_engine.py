@@ -101,6 +101,9 @@ def settings(tmp_path: Path) -> Settings:
         _env_file=None,
         workspace_dir=tmp_path / "workspace",
         cors_origins=["http://testserver"],
+        # Keep every test offline: an empty model means RunEngine builds no LLM client, so no
+        # test can reach a real provider even if a developer has one configured in .env.
+        llm_model="",
     )
 
 
@@ -164,6 +167,15 @@ def make_context(engine: RunEngine, run: Run) -> StepContext:
     )
 
 
+def run_workspace(settings: Settings, run: Run, slug: str = "acme__widgets") -> Path:
+    """The isolated checkout for one run: ``<workspace>/<owner>__<repo>/<run_id>``.
+
+    Phase 2 gave every run its own directory so concurrent runs of the same repository
+    cannot see each other's edits, so tests that inspect a clone have to ask for the run.
+    """
+    return settings.workspace_dir.resolve() / slug / run.id
+
+
 # ------------------------------------------------------------------ unit: inspect
 
 
@@ -216,6 +228,18 @@ class TestInspectTree:
 class TestPipelineShape:
     def test_pipeline_names_are_stable(self) -> None:
         assert [step.name for step in default_pipeline()] == [
+            "validate",
+            "resolve",
+            "clone",
+            "inspect",
+            "profile",
+            "select_files",
+            "plan",
+        ]
+
+    def test_phase_one_steps_come_first(self) -> None:
+        """Phase 2 is additive: the four Phase 1 steps still lead, in their original order."""
+        assert [step.name for step in default_pipeline()][:4] == [
             "validate",
             "resolve",
             "clone",
@@ -312,7 +336,7 @@ class TestEngineHappyPath:
         assert [e.sequence for e in events] == list(range(1, len(events) + 1))
 
         clone = next(e for e in events if e.step == "clone" and e.type is EventType.STEP_COMPLETED)
-        assert clone.data["head"] == await _head_of(settings.workspace_dir / "acme__widgets")
+        assert clone.data["head"] == await _head_of(run_workspace(settings, run))
 
         inspect = next(
             e for e in events if e.step == "inspect" and e.type is EventType.STEP_COMPLETED
@@ -522,21 +546,24 @@ class TestEngineFailurePaths:
         assert final.status is RunStatus.FAILED
         assert "archived" in (final.error or "")
 
-    async def test_the_same_repository_can_be_cloned_twice(
+    async def test_two_runs_of_one_repository_get_isolated_checkouts(
         self, settings: Settings, fake_repo: Path
     ) -> None:
-        """A second run over the same repo must clear the previous checkout and succeed."""
+        """Two runs of the same repository must not share a checkout.
+
+        Phase 2 writes code into the workspace, so a run that could see another run's edits
+        could overwrite them, and neither may touch a checkout the user made themselves.
+        """
         engine = make_engine(settings, steps=full_pipeline(fake_repo))
 
         first = await engine.start(repository="acme/widgets", task="first")
         await engine.wait_for(first.id, 60)
         assert (await engine.store.require_run(first.id)).status is RunStatus.SUCCEEDED
 
-        target = settings.workspace_dir.resolve() / "acme__widgets"
-        assert (target / ".git").is_dir()
-        # Git marks packs read-only; the replacement path has to cope with that.
-        for packed in (target / ".git" / "objects" / "pack").glob("*"):
-            packed.chmod(stat.S_IREAD)
+        first_dir = run_workspace(settings, first)
+        assert (first_dir / ".git").is_dir()
+        # A marker the first run "wrote", standing in for the edits Phase 2 will make.
+        (first_dir / "src" / "widgets" / "core.py").write_text("EDITED = True\n", encoding="utf-8")
 
         second = await engine.start(repository="acme/widgets", task="second")
         await engine.wait_for(second.id, 60)
@@ -544,8 +571,50 @@ class TestEngineFailurePaths:
 
         assert final.status is RunStatus.SUCCEEDED
         assert final.error is None
-        assert (target / ".git").is_dir()
+        second_dir = run_workspace(settings, second)
+        assert second_dir != first_dir
+        assert (second_dir / ".git").is_dir()
+        # The second clone came from the origin, and did not disturb the first run.
+        assert (second_dir / "src" / "widgets" / "core.py").read_text(encoding="utf-8") == (
+            "def run():\n    return 1\n"
+        )
+        assert (first_dir / "src" / "widgets" / "core.py").read_text(
+            encoding="utf-8"
+        ) == "EDITED = True\n"
 
+        await engine.shutdown()
+
+    async def test_a_stale_read_only_checkout_is_replaced(
+        self, settings: Settings, fake_repo: Path
+    ) -> None:
+        """Re-cloning over a leftover checkout must survive git's read-only object packs."""
+        engine = make_engine(settings, steps=full_pipeline(fake_repo))
+
+        first = await engine.start(repository="acme/widgets", task="first")
+        await engine.wait_for(first.id, 60)
+
+        second = await engine.start(repository="acme/widgets", task="second")
+        await engine.wait_for(second.id, 60)
+        assert (await engine.store.require_run(second.id)).status is RunStatus.SUCCEEDED
+
+        # Reuse the second run's slot for a third attempt by forcing the clone step to run
+        # again against a checkout whose packs are read-only, as Windows leaves them.
+        stale = run_workspace(settings, second)
+        for packed in (stale / ".git" / "objects" / "pack").glob("*"):
+            packed.chmod(stat.S_IREAD)
+
+        ctx = make_context(engine, await engine.store.require_run(second.id))
+        ctx.services.llm = None
+        ctx.state["repository_info"] = RepositoryInfo(
+            full_name="acme/widgets",
+            default_branch="main",
+            html_url="https://github.com/acme/widgets",
+            clone_url=str(fake_repo),
+        )
+        outcome = await CloneRepositoryStep().execute(ctx)
+
+        assert outcome is StepOutcome.OK
+        assert (stale / ".git").is_dir()
         await engine.shutdown()
 
     async def test_the_run_is_terminal_before_run_finished_is_announced(
@@ -778,6 +847,9 @@ class TestEngineLifecycle:
             "resolve",
             "clone",
             "inspect",
+            "profile",
+            "select_files",
+            "plan",
         ]
 
         await engine.shutdown()

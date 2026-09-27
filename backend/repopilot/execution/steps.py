@@ -38,36 +38,51 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar
 
+from repopilot.agent.llm import ChatClient, LLMError, LLMNotConfiguredError
+from repopilot.agent.plan import PlanRejectedError, generate_plan
+from repopilot.analysis.profile import (
+    IGNORED_DIRECTORIES as _IGNORED_DIRECTORIES,
+)
+from repopilot.analysis.profile import (
+    ProfileError,
+    RepositoryProfile,
+    build_profile,
+)
+from repopilot.analysis.relevance import (
+    DEFAULT_CANDIDATE_LIMIT,
+    CandidateFile,
+    rank_candidates,
+    tokenize,
+)
 from repopilot.core.errors import RepopilotError
 from repopilot.domain.models import EventLevel, EventType, Run
 from repopilot.domain.repository import RepositoryRef
 from repopilot.domain.store import RunStore
 from repopilot.github.client import GitHubClient, RepositoryInfo
 
+__all__ = [
+    "IGNORED_DIRECTORIES",
+    "IGNORED_SUFFIXES",
+    "BuildRepositoryProfileStep",
+    "CloneRepositoryStep",
+    "CreateImplementationPlanStep",
+    "GitResult",
+    "InspectRepositoryStep",
+    "ResolveRepositoryStep",
+    "RunServices",
+    "SelectRelevantFilesStep",
+    "Step",
+    "StepContext",
+    "StepFailed",
+    "StepOutcome",
+    "ValidateRequestStep",
+    "default_pipeline",
+]
+
 #: Directories never worth descending into when inspecting a repository.
-IGNORED_DIRECTORIES = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        "node_modules",
-        "__pycache__",
-        ".venv",
-        "venv",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        "dist",
-        "build",
-        "target",
-        "vendor",
-        ".next",
-        ".tox",
-        "htmlcov",
-        ".idea",
-        ".gradle",
-    }
-)
+#: Re-exported from :mod:`repopilot.analysis.profile` so the Phase 1 inspect step and the
+#: Phase 2 analysis pass cannot drift apart.
+IGNORED_DIRECTORIES = _IGNORED_DIRECTORIES
 
 IGNORED_SUFFIXES = frozenset(
     {
@@ -158,12 +173,14 @@ class StepFailed(RepopilotError):
 class RunServices:
     """Long-lived collaborators available to every step in a run.
 
-    Phase 1 ships only ``github``. The LLM client, the shell sandbox, and the diff writer are
-    added to this container as they are implemented.
+    ``github`` is the GitHub REST client. ``llm`` is the reasoning backend, which is ``None``
+    when no model is configured; steps that need it raise ``LLMNotConfiguredError`` rather than
+    inventing output. The shell sandbox and the diff writer arrive in later phases.
     """
 
     github: GitHubClient
     workspace: Path
+    llm: ChatClient | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -188,9 +205,18 @@ class StepContext:
     def attempt_label(self) -> str:
         return "" if self.attempt == 0 else f" (attempt {self.attempt + 1})"
 
-    def local_path(self) -> Path:
-        """Where this repository is cloned inside the workspace."""
+    def repo_dir(self) -> Path:
+        """The per-repository directory that holds one isolated workspace per run.
+
+        Phase 1 cloned every run of a repository into a single shared directory. Phase 2
+        writes code, so two runs of the same repository must not be able to see each other's
+        edits, and a run must never touch a checkout the user made themselves.
+        """
         return self.services.workspace / self.run.repository.slug.replace("/", "__")
+
+    def local_path(self) -> Path:
+        """This run's isolated checkout: ``<workspace>/<owner>__<repo>/<run_id>``."""
+        return self.repo_dir() / self.run.id
 
 
 class Step(ABC):
@@ -552,11 +578,264 @@ def _tail(raw: str, limit: int = 400) -> str:
     return " | ".join(lines[-3:])[-limit:]
 
 
+def _truncate(text: str, limit: int) -> str:
+    """Shorten a message for a single terminal line."""
+    collapsed = " ".join(text.split())
+    return collapsed if len(collapsed) <= limit else f"{collapsed[: limit - 1]}…"
+
+
+class BuildRepositoryProfileStep(Step):
+    """Measure the cloned workspace before anything reasons about it.
+
+    The Phase 1 inspect step counts files; this one reads them. It produces a
+    :class:`~repopilot.analysis.profile.RepositoryProfile` with per-file language and line
+    counts, and hands it to the next step through ``ctx.state``.
+    """
+
+    name = "profile"
+    title = "Profile repository"
+
+    async def execute(self, ctx: StepContext) -> StepOutcome:
+        root = ctx.local_path()
+        if not root.is_dir():
+            raise StepFailed(f"{root} does not exist; the clone step must run first")
+
+        await ctx.emit(EventType.STEP_STARTED, f"Profiling {ctx.repository.slug}")
+
+        try:
+            profile = await asyncio.to_thread(
+                build_profile, root, default_branch=ctx.state.get("default_branch")
+            )
+        except ProfileError as exc:
+            raise StepFailed(str(exc)) from exc
+
+        ctx.state["profile"] = profile
+
+        languages = ", ".join(f"{name} {count}" for name, count in profile.languages[:5]) or "none"
+        await ctx.emit(
+            EventType.STEP_PROGRESS,
+            f"Profiled {len(profile.files)} source files ({languages})",
+            progress=0.5,
+            data={
+                "root": str(root),
+                "total_files": profile.total_files,
+                "source_files": len(profile.files),
+                "skipped_files": profile.skipped_files,
+                "languages": [name for name, _ in profile.languages[:8]],
+                "manifests": list(profile.manifests),
+                "test_configs": list(profile.test_configs),
+                "test_files": len(profile.test_files),
+                "top_level": list(profile.top_level[:30]),
+            },
+        )
+
+        await ctx.emit(
+            EventType.STEP_COMPLETED,
+            f"Profiled {profile.total_files} files, {len(profile.files)} of them source",
+            data={
+                "source_files": len(profile.files),
+                "languages": [name for name, _ in profile.languages[:8]],
+                "manifests": list(profile.manifests),
+                "test_files": len(profile.test_files),
+            },
+        )
+        return StepOutcome.OK
+
+
+class SelectRelevantFilesStep(Step):
+    """Rank the repository's files against the task and stream the shortlist.
+
+    This is deterministic on purpose: the model only ever sees files that a reproducible
+    heuristic already found, and every ``file.selected`` event carries the reasons it was
+    chosen, so a run can always explain itself.
+    """
+
+    name = "select_files"
+    title = "Select relevant files"
+    candidate_limit = DEFAULT_CANDIDATE_LIMIT
+
+    async def execute(self, ctx: StepContext) -> StepOutcome:
+        profile: RepositoryProfile | None = ctx.state.get("profile")
+        if profile is None:
+            raise StepFailed("no repository profile; the profile step must run first")
+
+        await ctx.emit(
+            EventType.STEP_STARTED, f"Selecting files for '{_truncate(ctx.run.task, 60)}'"
+        )
+
+        candidates = await asyncio.to_thread(
+            rank_candidates,
+            profile,
+            ctx.run.task,
+            root=ctx.local_path(),
+            limit=self.candidate_limit,
+        )
+        ctx.state["candidates"] = candidates
+
+        if not candidates:
+            keywords = ", ".join(tokenize(ctx.run.task)[:8]) or "(none)"
+            await ctx.emit(
+                EventType.LOG,
+                f"No file in this repository matched the task (keywords: {keywords})",
+                level=EventLevel.WARN,
+                data={"keywords": tokenize(ctx.run.task), "candidates": 0},
+            )
+            await ctx.emit(
+                EventType.STEP_COMPLETED, "No candidate files found", data={"candidates": 0}
+            )
+            return StepOutcome.OK
+
+        # Only the strongest candidates are worth an event each; the rest go in one summary.
+        announced = candidates[:10]
+        for candidate in announced:
+            await ctx.emit(
+                EventType.FILE_SELECTED,
+                f"{candidate.path} ({candidate.language or 'unknown'}, {candidate.lines} lines)",
+                data={**candidate.as_dict(), "root": str(ctx.local_path())},
+            )
+        if len(candidates) > len(announced):
+            await ctx.emit(
+                EventType.STEP_PROGRESS,
+                f"+{len(candidates) - len(announced)} more candidate files",
+                progress=1.0,
+                data={"remaining": len(candidates) - len(announced)},
+            )
+
+        await ctx.emit(
+            EventType.LOG,
+            f"Shortlisted {len(candidates)} of {profile.total_files} files for "
+            f"'{_truncate(ctx.run.task, 60)}'",
+            data={"candidates": len(candidates), "total_files": profile.total_files},
+        )
+        await ctx.emit(
+            EventType.STEP_COMPLETED,
+            f"Shortlisted {len(candidates)} files",
+            data={
+                "candidates": len(candidates),
+                "total_files": profile.total_files,
+                "paths": [candidate.path for candidate in announced],
+            },
+        )
+        return StepOutcome.OK
+
+
+class CreateImplementationPlanStep(Step):
+    """Ask the configured model for a structured plan, grounded in the profile and shortlist.
+
+    This is the first step that needs a reasoning backend. With no model configured the run
+    fails with a message that says exactly which settings are missing, because a run that
+    appears to plan while doing nothing is the failure mode worth spending code to prevent.
+    """
+
+    name = "plan"
+    title = "Create implementation plan"
+
+    async def execute(self, ctx: StepContext) -> StepOutcome:
+        client = ctx.services.llm
+        if client is None:
+            raise StepFailed(
+                "no reasoning backend is configured, so no implementation plan can be "
+                "generated. Set REPOPILOT_LLM_MODEL and REPOPILOT_LLM_BASE_URL (plus "
+                "REPOPILOT_LLM_API_KEY for hosted providers) in .env, or start a local "
+                "OpenAI-compatible server such as Ollama."
+            )
+
+        profile: RepositoryProfile | None = ctx.state.get("profile")
+        if profile is None:
+            raise StepFailed("no repository profile; the profile step must run first")
+
+        candidates: list[CandidateFile] = ctx.state.get("candidates") or []
+        if not candidates:
+            raise StepFailed(
+                "no file in this repository looks related to the task, so there is nothing "
+                "to plan. Repositories in unfamiliar languages may need the profile step's "
+                "file list widened."
+            )
+
+        await ctx.emit(
+            EventType.STEP_STARTED,
+            f"Planning against {len(candidates)} files with {client.model}",
+            data={"model": client.model, "candidates": len(candidates)},
+        )
+        await ctx.emit(
+            EventType.STEP_PROGRESS,
+            f"Asking {client.model} to plan against {len(candidates)} files",
+            progress=0.25,
+            data={"model": client.model, "candidates": len(candidates)},
+        )
+
+        try:
+            plan, dropped = await generate_plan(
+                client,
+                task=ctx.run.task,
+                repository=ctx.run.repository.slug,
+                profile=profile,
+                candidates=candidates,
+                default_branch=ctx.state.get("default_branch"),
+                root=ctx.local_path(),
+            )
+        except PlanRejectedError as exc:
+            raise StepFailed(str(exc), retryable=True) from exc
+        except LLMNotConfiguredError as exc:
+            raise StepFailed(str(exc)) from exc
+        except LLMError as exc:
+            # Transport, auth, and rate-limit problems are worth one more attempt.
+            raise StepFailed(f"reasoning backend failed: {exc}", retryable=True) from exc
+
+        ctx.state["plan"] = plan
+
+        if dropped:
+            await ctx.emit(
+                EventType.LOG,
+                f"Ignored {len(dropped)} path(s) the model invented: {', '.join(dropped[:5])}",
+                level=EventLevel.WARN,
+                data={"hallucinated_paths": dropped},
+            )
+
+        await ctx.emit(
+            EventType.PLAN_CREATED,
+            plan.summary,
+            data={
+                "plan": plan.as_dict(),
+                "dropped_paths": dropped,
+                "model": plan.model,
+                "workspace": str(ctx.local_path()),
+            },
+        )
+        for step in plan.steps:
+            targets = ", ".join(step.files) or "no files yet"
+            await ctx.emit(
+                EventType.STEP_PROGRESS,
+                f"Plan step {step.order}/{len(plan.steps)}: {step.title} -> {targets}",
+                progress=0.4 + 0.6 * (step.order / max(len(plan.steps), 1)),
+                data={"order": step.order, "title": step.title, "files": step.files},
+            )
+
+        await ctx.emit(
+            EventType.STEP_COMPLETED,
+            f"Planned {len(plan.steps)} step(s) across {len(plan.files_to_change)} file(s)",
+            data={
+                "steps": len(plan.steps),
+                "files_to_change": plan.files_to_change,
+                "model": plan.model,
+                "dropped_paths": dropped,
+            },
+        )
+        return StepOutcome.OK
+
+
 def default_pipeline() -> tuple[Step, ...]:
-    """The Phase 1 pipeline. Agent steps are appended here as they are implemented."""
+    """The default pipeline: Phase 1's four steps followed by Phase 2A discovery and planning.
+
+    Phase 2A is additive, so the four Phase 1 steps still run first and still mean what they
+    meant. Steps that write code (2B) and run tests (2C) are appended here when they exist.
+    """
     return (
         ValidateRequestStep(),
         ResolveRepositoryStep(),
         CloneRepositoryStep(),
         InspectRepositoryStep(),
+        BuildRepositoryProfileStep(),
+        SelectRelevantFilesStep(),
+        CreateImplementationPlanStep(),
     )

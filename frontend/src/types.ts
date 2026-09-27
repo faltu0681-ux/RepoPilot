@@ -27,8 +27,51 @@ export type EventType =
   | 'step.completed'
   | 'step.failed'
   | 'log'
+  | 'file.selected'
+  | 'plan.created'
 
 export type EventLevel = 'debug' | 'info' | 'warn' | 'error'
+
+/** Mirrors `repopilot.analysis.relevance.CandidateFile`. */
+export interface SelectedFile {
+  path: string
+  score: number
+  reasons: string[]
+  language: string | null
+  lines: number
+  is_test: boolean
+  root?: string
+}
+
+/** Mirrors `repopilot.agent.schema`. */
+export type FileRole = 'modify' | 'add' | 'read'
+
+export interface PlanFile {
+  path: string
+  reason: string
+  role: FileRole
+}
+
+export interface PlanStep {
+  order: number
+  title: string
+  detail: string
+  files: string[]
+  rationale: string
+}
+
+export interface ImplementationPlan {
+  summary: string
+  approach: string
+  relevant_files: PlanFile[]
+  steps: PlanStep[]
+  risks: string[]
+  test_strategy: string
+  files_to_change: string[]
+  model: string
+  prompt_tokens: number | null
+  completion_tokens: number | null
+}
 
 export interface ExecutionEvent {
   run_id: string

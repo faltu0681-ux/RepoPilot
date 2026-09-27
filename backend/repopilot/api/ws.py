@@ -9,7 +9,9 @@ Frame types, discriminated by ``type``:
   arrives: protocol version, the run subscribed to, and the sequence it is resuming after.
 * ``event``   - one :class:`ExecutionEvent`, exactly as stored. Each carries its ``sequence``,
   so the client always knows its own cursor.
-* ``status``  - a run changed status, or a run was created.
+* ``status``  - a run changed status, or a run was created. A run-scoped stream always sends one
+  last ``status`` immediately before its ``bye``, so a client that only reads the stream still
+  learns how the run ended.
 * ``resync``  - the subscriber fell behind and events were dropped. ``from_sequence`` says where
   the last delivered event ended, so the client refetches
   ``GET /api/runs/{id}/events?after_sequence=`` and continues.
@@ -114,6 +116,13 @@ async def stream_events(
         async with bus.subscribe(run_id=run_id) as subscription:
             await _send(websocket, HelloFrame(run_id=run_id, after_sequence=after_sequence))
             replayed = await _replay(websocket, store, run_id, after_sequence)
+            if run_id is not None and await _run_is_terminal(store, run_id):
+                # Attaching to a run that is already over. Its terminal ``status`` was published
+                # before this subscriber existed, so it will never arrive on the bus. Say it here,
+                # or the client waits on a queue that can only ever be empty.
+                await _send_terminal_status(websocket, store, run_id)
+                await _send(websocket, ByeFrame(reason="run already finished"))
+                return
             await _pump(websocket, subscription, store, run_id, replayed)
         await websocket.close(code=1000)
     except asyncio.CancelledError:
@@ -199,16 +208,35 @@ async def _pump(
             )
 
         if run_id is not None and await _run_has_finished(store, run_id, item):
+            # The run's last event beat its terminal ``status`` onto the bus. Without this the
+            # client sees ``bye`` and never finds out whether it succeeded or failed.
+            await _send_terminal_status(websocket, store, run_id)
             await _send(websocket, ByeFrame(reason="run finished"))
             return
+
+
+async def _run_is_terminal(store: RunStore, run_id: str) -> bool:
+    run = await store.get_run(run_id)
+    return run is not None and run.is_terminal
+
+
+async def _send_terminal_status(websocket: WebSocket, store: RunStore, run_id: str) -> None:
+    """Send the run's authoritative status, read from the store rather than the bus.
+
+    The terminal status is a bus publication, and a bus publication only reaches subscribers that
+    were listening at the time. Reading it back from the store is what makes the stream
+    self-sufficient, so a client never has to fall back to REST to learn the outcome.
+    """
+    run = await store.get_run(run_id)
+    if run is not None:
+        await _send(websocket, StatusFrame(run_id=run_id, status=run.status.value))
 
 
 async def _run_has_finished(store: RunStore, run_id: str, event: ExecutionEvent) -> bool:
     """True when this event was the last one a finished run will ever emit."""
     if event.type is not EventType.RUN_FINISHED:
         return False
-    run = await store.get_run(run_id)
-    return run is not None and run.is_terminal
+    return await _run_is_terminal(store, run_id)
 
 
 async def _send(websocket: WebSocket, frame: Any) -> None:
