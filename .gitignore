@@ -59,6 +59,8 @@ Thumbs.db
 desktop.ini
 
 # ---- Repopilot runtime artefacts ----
+# Cloned repositories, run logs, and anything the engine writes to disk.
+.repopilot-data/
 repopilot-data/
 .runs/
 *.log
