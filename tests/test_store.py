@@ -81,20 +81,16 @@ class TestCreateAndRead:
 
         assert len(await store.list_runs(limit=3)) == 3
 
-    async def test_counts_by_status(self, store: RunStore) -> None:
+    async def test_count_runs(self, store: RunStore) -> None:
         await make_run(store)
         done = await make_run(store)
         await store.transition(done.id, RunStatus.RUNNING)
         await store.transition(done.id, RunStatus.SUCCEEDED)
 
-        counts = await store.counts_by_status()
-        assert counts == {
-            "pending": 1,
-            "running": 0,
-            "succeeded": 1,
-            "failed": 0,
-            "cancelled": 0,
-        }
+        assert await store.count_runs() == 2
+        assert await store.count_runs(status=RunStatus.PENDING) == 1
+        assert await store.count_runs(status=RunStatus.SUCCEEDED) == 1
+        assert await store.count_runs(status=RunStatus.FAILED) == 0
 
 
 class TestTransitions:

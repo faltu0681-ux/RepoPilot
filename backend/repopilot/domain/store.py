@@ -159,12 +159,12 @@ class RunStore:
 
     # ----------------------------------------------------------------- stats
 
-    async def counts_by_status(self) -> dict[str, int]:
+    async def count_runs(self, *, status: RunStatus | None = None) -> int:
+        """How many runs are stored, optionally restricted to one status."""
         async with self._lock:
-            counts: dict[str, int] = {status.value: 0 for status in RunStatus}
-            for run in self._runs.values():
-                counts[run.status.value] += 1
-            return counts
+            if status is None:
+                return len(self._runs)
+            return sum(1 for run in self._runs.values() if run.status == status)
 
     async def purge_terminal(self) -> int:
         """Drop finished runs. Useful for long-lived dev servers; not used in production paths."""

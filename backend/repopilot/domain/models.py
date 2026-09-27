@@ -14,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    computed_field,
     field_serializer,
     field_validator,
 )
@@ -116,10 +117,12 @@ class Run(BaseModel):
             short_id = self.id.split("_", 1)[-1][:8]
             self.branch = f"repopilot/{short_id}"
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_RUN_STATUSES
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def duration_seconds(self) -> float | None:
         if self.started_at is None:
@@ -127,6 +130,7 @@ class Run(BaseModel):
         end = self.finished_at or utcnow()
         return (end - self.started_at).total_seconds()
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def progress(self) -> float:
         """Fraction of steps finished, in ``0.0..1.0``. Zero when the plan is unknown."""

@@ -13,19 +13,26 @@ GitHub repo -> Create Run -> Execution state -> Live events -> WebSocket -> Term
 ## Status
 
 **Phase 1 — vertical slice.** The agent loop is not implemented yet. What works today is the
-spine: create a run, give it real execution state, stream real events over a WebSocket, and
-render them in a terminal UI. Every seam the agent will later need (analysis, planning,
-editing, test execution, diagnosis, retry, PR creation) is a pluggable step in the pipeline,
-so the loop drops in without reshaping the architecture.
+spine: create a run, give it real execution state, drive a real step pipeline that talks to
+GitHub and clones the repository, stream every observation as a live event over a WebSocket,
+and render them in a terminal UI.
+
+The pipeline really does work, it just does not write code yet:
+
+    validate -> resolve -> clone -> inspect
 
 | Milestone | What it adds |
 | --- | --- |
 | 1 | Project skeleton, packaging, secrets rules |
 | 2 | FastAPI app, config, `/health` |
 | 3 | Run state management (`Run`, statuses, in-memory store) |
-| 4 | Execution event system (event bus, step pipeline, real events) |
+| 4 | Execution engine: event bus, step pipeline, real GitHub + clone + inspect steps |
 | 5 | WebSocket live event streaming |
 | 6 | React + Vite terminal UI |
+
+Every seam the agent needs later already exists: repository analysis is `InspectRepositoryStep`,
+`StepOutcome.RETRY` plus `Run.attempts` is the fix loop, `RunServices` is where the LLM and
+sandbox clients go, and each agent capability is one more entry in `default_pipeline()`.
 
 ## Requirements
 
@@ -55,6 +62,29 @@ Run the tests:
 ```bash
 pytest
 ```
+
+## Trying a run
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"repository": "octocat/Hello-World", "task": "Add a /health endpoint"}'
+```
+
+The call returns immediately with a run id. Watch the work:
+
+```bash
+curl http://127.0.0.1:8000/api/runs/<run_id>
+curl http://127.0.0.1:8000/api/runs/<run_id>/events
+```
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /api/runs` | Create a run and start the pipeline |
+| `GET /api/runs` | List runs, newest first (`?status=`, `?limit=`) |
+| `GET /api/runs/{id}` | Current state of one run |
+| `GET /api/runs/{id}/events` | Full event history, with an `?after_sequence=` cursor |
+| `DELETE /api/runs/{id}` | Cancel an in-flight run |
 
 ## Configuration
 
