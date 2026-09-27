@@ -28,7 +28,7 @@ The pipeline really does work, it just does not write code yet:
 | 3 | Run state management (`Run`, statuses, in-memory store) | done |
 | 4 | Execution engine: event bus, step pipeline, real GitHub + clone + inspect steps | done |
 | 5 | WebSocket live event streaming | done |
-| 6 | React + Vite terminal UI | next |
+| 6 | React + Vite terminal UI | done |
 
 Every seam the agent needs later already exists: repository analysis is `InspectRepositoryStep`,
 `StepOutcome.RETRY` plus `Run.attempts` is the fix loop, `RunServices` is where the LLM and
@@ -153,7 +153,8 @@ in this repository. If you add a secret-handling path later, read it from the en
 
 ## Terminal UI
 
-Not built yet; this is milestone 6. The plan:
+The Vite dev server runs on <http://localhost:5173> and proxies both `/api` and `/ws` to the
+backend, so the browser talks to one origin and there is no CORS preflight.
 
 ```bash
 cd frontend
@@ -161,8 +162,33 @@ npm install
 npm run dev
 ```
 
-The Vite dev server runs on <http://localhost:5173> and proxies API and WebSocket traffic to
-the backend on port 8000. `REPOPILOT_CORS_ORIGINS` already allows that origin.
+Start the backend first, then open the page, enter a repository and a task, and press **Start run**.
+Events stream in live and the panel follows the tail until you scroll up, at which point it stops
+chasing so you can read.
+
+```bash
+npm run lint      # oxlint
+npm run build     # tsc -b && vite build
+```
+
+`REPOPILOT_BACKEND` overrides the proxy target if the backend is not on port 8000.
+
+### How the client uses the stream
+
+`frontend/src/useRunStream.ts` holds the three things that make an at-any-time attach work:
+
+- the cursor advances with the highest sequence seen and is sent as `after_sequence` on every
+  reconnect, so a flaky connection never re-renders what is already on screen;
+- a `resync` frame triggers a REST refetch from the sequence the server names, so a slow client
+  ends up with a complete stream rather than a hole;
+- events are deduped by sequence on the way in, so a duplicate delivery is a no-op.
+
+Reconnection backs off exponentially to 10s. A `bye` is treated as final, because a run-scoped
+socket only says goodbye once the run is terminal.
+
+The panel is a styled event log rather than an `xterm.js` terminal, because Phase 1 renders
+structured run events rather than raw process output. When the agent starts shelling out, that is
+the point to swap in a real terminal.
 
 ## Architecture
 
@@ -174,7 +200,11 @@ backend/repopilot/
   execution/       Engine, event bus, step pipeline (the pluggable agent seam)
   github/          GitHub client (repo metadata, clone, PR creation)
   api/             HTTP routes and the WebSocket endpoint
-frontend/src/      React terminal UI
+frontend/
+  src/types.ts     Wire types mirroring the backend frames
+  src/api.ts       REST client
+  src/useRunStream.ts  WebSocket subscription: cursor, resync, reconnect
+  src/App.tsx      Form and live terminal
 tests/             pytest suite
 ```
 
