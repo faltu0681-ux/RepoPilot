@@ -28,6 +28,7 @@ import contextlib
 import os
 import shutil
 import stat
+import subprocess
 import time
 from abc import ABC, abstractmethod
 from collections import Counter
@@ -128,6 +129,9 @@ MANIFEST_FILES = frozenset(
 )
 
 EmitFn = Callable[..., Awaitable[Any]]
+
+#: Wall-clock ceiling for any single git invocation.
+GIT_TIMEOUT_SECONDS = 600.0
 
 
 class StepOutcome(StrEnum):
@@ -317,8 +321,7 @@ class CloneRepositoryStep(Step):
 
         loop = asyncio.get_running_loop()
         started = loop.time()
-        process = await asyncio.create_subprocess_exec(
-            "git",
+        result = await _run_git(
             "clone",
             "--depth",
             "1",
@@ -327,15 +330,11 @@ class CloneRepositoryStep(Step):
             info.default_branch,
             info.clone_url,
             str(target),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
-        _stdout, stderr = await process.communicate()
 
-        if process.returncode != 0:
+        if result.returncode != 0:
             raise StepFailed(
-                f"git clone exited {process.returncode}: {_tail(stderr)}", retryable=True
+                f"git clone exited {result.returncode}: {_tail(result.stderr)}", retryable=True
             )
 
         elapsed = round(loop.time() - started, 3)
@@ -503,23 +502,50 @@ def _force_unlink(func: Callable[[str], Any], target: str, _exc: OSError) -> Non
 
 
 async def _git_head(path: Path) -> str | None:
-    process = await asyncio.create_subprocess_exec(
-        "git",
-        "-C",
-        str(path),
-        "rev-parse",
-        "HEAD",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    stdout, _ = await process.communicate()
-    if process.returncode != 0:
+    result = await _run_git("-C", str(path), "rev-parse", "HEAD")
+    if result.returncode != 0:
         return None
-    return stdout.decode().strip() or None
+    return result.stdout.strip() or None
 
 
-def _tail(raw: bytes, limit: int = 400) -> str:
-    text = raw.decode(errors="replace").strip()
+@dataclass(slots=True)
+class GitResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+async def _run_git(*args: str) -> GitResult:
+    """Run git in a worker thread rather than through the event loop.
+
+    On Windows, uvicorn hands a reload-mode server a ``SelectorEventLoop`` so that its own
+    reloader can fork, and a selector loop cannot spawn subprocesses at all. Anything that shells
+    out to git therefore dies with ``NotImplementedError`` the moment you run the app the way the
+    README says to, and only on Windows. Driving ``subprocess`` from a thread keeps the clone step
+    working under every loop policy, and keeps the event loop free while git works.
+    """
+
+    def call() -> GitResult:
+        process = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=GIT_TIMEOUT_SECONDS,
+            # Never let git stop and ask for a password on an unattended clone.
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        return GitResult(process.returncode, process.stdout, process.stderr)
+
+    try:
+        async with asyncio.timeout(GIT_TIMEOUT_SECONDS):
+            return await asyncio.to_thread(call)
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        raise StepFailed(f"git {args[0]} timed out after {GIT_TIMEOUT_SECONDS}s") from exc
+
+
+def _tail(raw: str, limit: int = 400) -> str:
+    text = raw.strip()
     if not text:
         return "no output"
     lines = [line for line in text.splitlines() if line.strip()]

@@ -11,6 +11,7 @@ import asyncio
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -34,6 +35,7 @@ from repopilot.execution.steps import (
     StepOutcome,
     ValidateRequestStep,
     _force_rmtree,
+    _git_head,
     _inspect_tree,
     default_pipeline,
 )
@@ -779,6 +781,54 @@ class TestEngineLifecycle:
         ]
 
         await engine.shutdown()
+
+
+# ----------------------------------------------------------------------- helpers
+
+
+class TestSelectorEventLoop:
+    """uvicorn --reload on Windows hands the app a loop that cannot spawn processes.
+
+    `uvicorn/loops/asyncio.py` returns a SelectorEventLoop whenever `use_subprocess` is true, and
+    `use_subprocess` is true whenever `reload` is on. A selector loop has no subprocess support on
+    Windows, so any step that shells out used to die with NotImplementedError -- but only under
+    `--reload`, and only on Windows. Shelling out from a worker thread is what makes this pass.
+    """
+
+    def test_the_pipeline_runs_on_a_loop_without_subprocess_support(
+        self, settings: Settings, fake_repo: Path
+    ) -> None:
+        engine = make_engine(settings, steps=full_pipeline(fake_repo))
+
+        with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+            run = runner.run(engine.start(repository="acme/widgets", task="Add a health check"))
+            runner.run(engine.wait_for(run.id, 60))
+            final = runner.run(engine.store.require_run(run.id))
+            runner.run(engine.shutdown())
+
+        assert final.status is RunStatus.SUCCEEDED, final.error
+        assert final.error is None
+
+    def test_git_head_works_on_a_loop_without_subprocess_support(self, fake_repo: Path) -> None:
+        with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+            head = runner.run(_git_head(fake_repo))
+
+        assert head, "expected a commit in the fixture repository"
+
+    def test_the_loop_really_cannot_spawn_subprocesses(self) -> None:
+        """Guards the guard: if a future Python restores this, the tests above stop meaning much."""
+
+        async def spawn() -> None:
+            await asyncio.create_subprocess_exec("git", "--version")
+
+        with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+            if sys.platform == "win32":
+                with pytest.raises(NotImplementedError):
+                    runner.run(spawn())
+            else:
+                # On other platforms a selector loop spawns processes fine, so this is where the
+                # Windows-only breakage would not have shown up in the first place.
+                runner.run(spawn())
 
 
 # ----------------------------------------------------------------------- helpers
