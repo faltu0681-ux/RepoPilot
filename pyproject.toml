@@ -19,6 +19,7 @@ dependencies = [
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
+    "pytest-timeout>=2.3",
     "httpx2>=2.0",
     "ruff>=0.5",
 ]
@@ -36,6 +37,8 @@ packages = ["backend/repopilot"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# A WebSocket read that blocks forever should fail the test, not hang the suite.
+timeout = 60
 filterwarnings = ["error::DeprecationWarning:repopilot.*"]
 
 [tool.ruff]

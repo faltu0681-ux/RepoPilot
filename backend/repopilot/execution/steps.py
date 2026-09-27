@@ -27,6 +27,8 @@ import asyncio
 import contextlib
 import os
 import shutil
+import stat
+import time
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Awaitable, Callable
@@ -300,7 +302,12 @@ class CloneRepositoryStep(Step):
                 f"Replacing the existing checkout at {target}",
                 level=EventLevel.DEBUG,
             )
-            await asyncio.to_thread(shutil.rmtree, target, True)
+            try:
+                await asyncio.to_thread(_force_rmtree, target)
+            except OSError as exc:
+                raise StepFailed(
+                    f"Could not clear the previous checkout at {target}: {exc}"
+                ) from exc
 
         await ctx.emit(
             EventType.STEP_STARTED,
@@ -465,6 +472,34 @@ def _frameworks_in(path: Path) -> set[str]:
 
 
 # ---------------------------------------------------------------------- helpers
+
+
+def _force_rmtree(path: Path, attempts: int = 4) -> None:
+    """Delete a tree even when Git has marked parts of it read-only.
+
+    Git writes its pack files read-only on Windows, so a plain :func:`shutil.rmtree` raises
+    ``PermissionError`` and leaves a half-deleted directory behind. The next clone then fails
+    with "destination path already exists and is not an empty directory", which reads like a
+    repository problem but is really a leftover one. Clearing the read-only bit and retrying
+    briefly also absorbs the short-lived locks held by antivirus and file indexers.
+    """
+    last: OSError | None = None
+    for attempt in range(attempts):
+        if not path.exists():
+            return
+        try:
+            shutil.rmtree(path, onexc=_force_unlink)
+            return
+        except OSError as exc:  # noqa: PERF203 - the retry is the point
+            last = exc
+            time.sleep(0.1 * (attempt + 1))
+    raise OSError(f"could not remove {path}: {last}")
+
+
+def _force_unlink(func: Callable[[str], Any], target: str, _exc: OSError) -> None:
+    """Clear the read-only bit, then retry the delete that just failed."""
+    os.chmod(target, stat.S_IWRITE)
+    func(target)
 
 
 async def _git_head(path: Path) -> str | None:

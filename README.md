@@ -21,14 +21,14 @@ The pipeline really does work, it just does not write code yet:
 
     validate -> resolve -> clone -> inspect
 
-| Milestone | What it adds |
-| --- | --- |
-| 1 | Project skeleton, packaging, secrets rules |
-| 2 | FastAPI app, config, `/health` |
-| 3 | Run state management (`Run`, statuses, in-memory store) |
-| 4 | Execution engine: event bus, step pipeline, real GitHub + clone + inspect steps |
-| 5 | WebSocket live event streaming |
-| 6 | React + Vite terminal UI |
+| Milestone | What it adds | Status |
+| --- | --- | --- |
+| 1 | Project skeleton, packaging, secrets rules | done |
+| 2 | FastAPI app, config, `/health` | done |
+| 3 | Run state management (`Run`, statuses, in-memory store) | done |
+| 4 | Execution engine: event bus, step pipeline, real GitHub + clone + inspect steps | done |
+| 5 | WebSocket live event streaming | done |
+| 6 | React + Vite terminal UI | next |
 
 Every seam the agent needs later already exists: repository analysis is `InspectRepositoryStep`,
 `StepOutcome.RETRY` plus `Run.attempts` is the fix loop, `RunServices` is where the LLM and
@@ -85,6 +85,55 @@ curl http://127.0.0.1:8000/api/runs/<run_id>/events
 | `GET /api/runs/{id}` | Current state of one run |
 | `GET /api/runs/{id}/events` | Full event history, with an `?after_sequence=` cursor |
 | `DELETE /api/runs/{id}` | Cancel an in-flight run |
+| `WS /ws/events` | Live event stream |
+
+## Watching a run live
+
+Polling works, but the stream is the point:
+
+```bash
+pip install websockets
+```
+
+```python
+import asyncio, json, websockets
+
+
+async def main():
+    async with websockets.connect("ws://127.0.0.1:8000/ws/events?run_id=<run_id>") as ws:
+        async for raw in ws:
+            frame = json.loads(raw)
+            if frame["type"] == "event":
+                e = frame["event"]
+                print(f"{e['sequence']:>3} {e['type']:<15} {e['message']}")
+            elif frame["type"] == "bye":
+                break
+
+
+asyncio.run(main())
+```
+
+Connecting is **replay-then-stream**: the socket sends stored history first, then live events
+follow. That is what lets a client attach to a run that is already half done and still render it
+whole.
+
+| Frame | Meaning |
+| --- | --- |
+| `hello` | Sent first. Protocol version, the run subscribed to, the sequence it resumed after |
+| `event` | One `ExecutionEvent`, exactly as stored, with its per-run `sequence` |
+| `status` | A run was created or changed status |
+| `resync` | The subscriber fell behind; refetch `/events?after_sequence=` from `from_sequence` |
+| `error` | The stream could not be established |
+| `bye` | The stream is closing, then the socket disconnects |
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `run_id` | _none_ | Follow one run. Omit to follow every run |
+| `after_sequence` | `0` | Resume after this cursor, so reconnects do not replay what you already have |
+
+A run-scoped socket closes on its own once the run reaches a terminal status. An unscoped socket
+stays open. Each subscriber has a bounded queue, so a client that cannot keep up gets a `resync`
+frame rather than unbounded memory growth.
 
 ## Configuration
 
@@ -104,6 +153,8 @@ in this repository. If you add a secret-handling path later, read it from the en
 
 ## Terminal UI
 
+Not built yet; this is milestone 6. The plan:
+
 ```bash
 cd frontend
 npm install
@@ -111,14 +162,7 @@ npm run dev
 ```
 
 The Vite dev server runs on <http://localhost:5173> and proxies API and WebSocket traffic to
-the backend on port 8000.
-
-For a production-style check, build the frontend and serve it from the backend:
-
-```bash
-cd frontend
-npm run build
-```
+the backend on port 8000. `REPOPILOT_CORS_ORIGINS` already allows that origin.
 
 ## Architecture
 

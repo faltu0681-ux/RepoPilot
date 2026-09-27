@@ -16,11 +16,24 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 from repopilot.domain.models import ExecutionEvent, RunStatus
 
 logger = logging.getLogger("repopilot.bus")
+
+
+@dataclass(frozen=True, slots=True)
+class RunStatusUpdate:
+    """A run changed status. Carries the run id so subscribers never have to guess."""
+
+    run_id: str
+    status: RunStatus
+
+
+#: What travels over a subscription queue: events, status changes, or ``None`` to close.
+BusItem = ExecutionEvent | RunStatusUpdate | None
 
 #: Per-subscriber backlog. When a consumer falls this far behind further events are dropped
 #: rather than allowed to consume unbounded memory; it recovers by replaying from the store.
@@ -34,9 +47,7 @@ class Subscription:
 
     def __init__(self, *, run_id: str | None = None, maxsize: int = DEFAULT_QUEUE_SIZE) -> None:
         self.run_id = run_id
-        self.queue: asyncio.Queue[ExecutionEvent | RunStatus | None] = asyncio.Queue(
-            maxsize=maxsize
-        )
+        self.queue: asyncio.Queue[BusItem] = asyncio.Queue(maxsize=maxsize)
         self.dropped = 0
 
     def __repr__(self) -> str:
@@ -45,17 +56,17 @@ class Subscription:
             f"queued={self.queue.qsize()} dropped={self.dropped}>"
         )
 
-    def __aiter__(self) -> AsyncIterator[ExecutionEvent | RunStatus]:
+    def __aiter__(self) -> AsyncIterator[BusItem]:
         return self._iterate()
 
-    async def _iterate(self) -> AsyncIterator[ExecutionEvent | RunStatus]:
+    async def _iterate(self) -> AsyncIterator[BusItem]:
         while True:
             item = await self.queue.get()
             if item is None:
                 return
             yield item
 
-    async def offer(self, item: ExecutionEvent | RunStatus) -> bool:
+    async def offer(self, item: BusItem) -> bool:
         """Enqueue without blocking. Returns False if the subscriber is too far behind."""
         try:
             self.queue.put_nowait(item)
@@ -99,20 +110,16 @@ class EventBus:
         await self._publish(event)
 
     async def publish_status(self, run_id: str, status: RunStatus) -> None:
-        await self._publish(status, run_id=run_id)
+        await self._publish(RunStatusUpdate(run_id=run_id, status=status))
 
     @property
     def subscriber_count(self) -> int:
         return len(self._subscriptions)
 
-    async def _publish(
-        self, item: ExecutionEvent | RunStatus, *, run_id: str | None = None
-    ) -> None:
-        event_run_id = run_id or getattr(item, "run_id", None)
+    async def _publish(self, item: ExecutionEvent | RunStatusUpdate) -> None:
+        run_id = item.run_id
         async with self._lock:
-            targets = [
-                s for s in self._subscriptions if s.run_id is None or s.run_id == event_run_id
-            ]
+            targets = [s for s in self._subscriptions if s.run_id is None or s.run_id == run_id]
         for subscription in targets:
             await subscription.offer(item)
 

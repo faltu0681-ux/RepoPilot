@@ -95,9 +95,7 @@ async def list_runs(
 ) -> RunListResponse:
     """List runs, newest first."""
     runs = await store.list_runs(status=run_status, limit=limit)
-    return RunListResponse(
-        runs=runs, total=await store.count_runs(status=run_status)
-    )
+    return RunListResponse(runs=runs, total=await store.count_runs(status=run_status))
 
 
 @router.get("/{run_id}", response_model=Run)

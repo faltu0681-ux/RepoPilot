@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from repopilot.domain.models import EventType, ExecutionEvent, RunStatus
-from repopilot.execution.bus import EventBus
+from repopilot.execution.bus import EventBus, RunStatusUpdate
 
 
 def make_event(run_id: str, message: str = "hello") -> ExecutionEvent:
@@ -64,7 +64,18 @@ class TestDelivery:
             await bus.publish_status("run_a", RunStatus.SUCCEEDED)
             received = await asyncio.wait_for(subscription.queue.get(), 1)
 
-        assert received is RunStatus.SUCCEEDED
+        assert received == RunStatusUpdate(run_id="run_a", status=RunStatus.SUCCEEDED)
+
+    async def test_status_updates_are_filtered_by_run(self) -> None:
+        bus = EventBus()
+
+        async with bus.subscribe(run_id="run_a") as subscription:
+            await bus.publish_status("run_b", RunStatus.FAILED)
+            await bus.publish_status("run_a", RunStatus.FAILED)
+
+            received = await asyncio.wait_for(subscription.queue.get(), 1)
+
+        assert received.run_id == "run_a"
 
     async def test_events_published_before_subscribing_are_not_delivered(self) -> None:
         bus = EventBus()

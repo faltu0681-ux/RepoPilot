@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from repopilot import __version__
-from repopilot.api import health_router, runs_router
+from repopilot.api import health_router, runs_router, ws_router
 from repopilot.config import Settings, get_settings
 from repopilot.core.errors import RepopilotError
 from repopilot.domain.store import RunStore
@@ -79,11 +79,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health_router, prefix=API_PREFIX)
     app.include_router(runs_router, prefix=API_PREFIX)
+    app.include_router(ws_router)
 
     @app.exception_handler(RepopilotError)
-    async def handle_repopilot_error(
-        request: Request, exc: RepopilotError
-    ) -> JSONResponse:
+    async def handle_repopilot_error(request: Request, exc: RepopilotError) -> JSONResponse:
         """Map domain errors onto HTTP without the domain knowing about HTTP."""
         logger.info("%s on %s: %s", type(exc).__name__, request.url.path, exc.message)
         return JSONResponse(

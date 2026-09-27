@@ -191,6 +191,8 @@ class RunEngine:
             raise
         except Exception as exc:  # noqa: BLE001 - the engine must never die silently
             logger.exception("run %s failed", run_id)
+            with contextlib.suppress(Exception):
+                await self._store.transition(run_id, RunStatus.FAILED, error=str(exc))
             await self._emit(
                 run_id,
                 EventType.RUN_FINISHED,
@@ -198,8 +200,6 @@ class RunEngine:
                 level=EventLevel.ERROR,
                 data={"error": str(exc), "type": type(exc).__name__},
             )
-            with contextlib.suppress(Exception):
-                await self._store.transition(run_id, RunStatus.FAILED, error=str(exc))
             await self._publish_status(run_id, RunStatus.FAILED)
 
     async def _run_pipeline(self, run_id: str, attempt: int) -> tuple[StepOutcome, str]:
@@ -325,6 +325,7 @@ class RunEngine:
         return event
 
     async def _fail(self, run_id: str, error: str) -> None:
+        run = await self._store.transition(run_id, RunStatus.FAILED, error=error)
         await self._emit(
             run_id,
             EventType.RUN_FINISHED,
@@ -332,7 +333,6 @@ class RunEngine:
             level=EventLevel.ERROR,
             data={"error": error},
         )
-        run = await self._store.transition(run_id, RunStatus.FAILED, error=error)
         await self._publish_status(run_id, run.status)
 
     async def _finish(self, run_id: str, status: RunStatus, error: str | None = None) -> None:
@@ -349,6 +349,9 @@ class RunEngine:
             RunStatus.CANCELLED: "Run cancelled",
             RunStatus.FAILED: f"Run failed: {error}",
         }[status]
+        # Settle the state first: an observer told the run is over must be able to read a
+        # terminal status straight afterwards, with no window where the two disagree.
+        run = await self._store.transition(run_id, status, error=error)
         await self._emit(
             run_id,
             EventType.RUN_FINISHED,
@@ -356,8 +359,7 @@ class RunEngine:
             level=level,
             data={"status": status.value, "error": error},
         )
-        await self._store.transition(run_id, status, error=error)
-        await self._publish_status(run_id, status)
+        await self._publish_status(run_id, run.status)
 
     async def _publish_status(self, run_id: str, status: RunStatus) -> None:
         await self._bus.publish_status(run_id, status)

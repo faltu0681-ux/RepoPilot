@@ -8,8 +8,11 @@ filesystem work, without touching the network.
 from __future__ import annotations
 
 import asyncio
+import shutil
+import stat
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 import httpx
 import pytest
@@ -18,7 +21,7 @@ from repopilot.config import Settings
 from repopilot.core.errors import NotFoundError
 from repopilot.domain.models import EventLevel, EventType, Run, RunStatus
 from repopilot.domain.store import RunStore
-from repopilot.execution.bus import EventBus
+from repopilot.execution.bus import EventBus, RunStatusUpdate
 from repopilot.execution.engine import RunEngine
 from repopilot.execution.steps import (
     CloneRepositoryStep,
@@ -30,6 +33,7 @@ from repopilot.execution.steps import (
     StepFailed,
     StepOutcome,
     ValidateRequestStep,
+    _force_rmtree,
     _inspect_tree,
     default_pipeline,
 )
@@ -226,6 +230,45 @@ class TestPipelineShape:
             assert callable(step.execute)
 
 
+class TestForceRmtree:
+    """Git marks its pack files read-only on Windows, which plain rmtree cannot delete."""
+
+    def test_removes_a_tree_full_of_read_only_files(self, tmp_path: Path) -> None:
+        target = tmp_path / "checkout"
+        (target / ".git" / "objects" / "pack").mkdir(parents=True)
+        for name in ("a.pack", "a.idx", "a.rev"):
+            packed = target / ".git" / "objects" / "pack" / name
+            packed.write_bytes(b"\x00" * 8)
+            packed.chmod(stat.S_IREAD)
+        (target / "README.md").write_text("hi", encoding="utf-8")
+
+        _force_rmtree(target)
+
+        assert not target.exists()
+
+    def test_a_missing_tree_is_not_an_error(self, tmp_path: Path) -> None:
+        _force_rmtree(tmp_path / "never-existed")
+
+    def test_a_locked_tree_raises_instead_of_leaving_a_half_directory(self, tmp_path: Path) -> None:
+        target = tmp_path / "checkout"
+        target.mkdir()
+        (target / "file.txt").write_text("hi", encoding="utf-8")
+        real_rmtree = shutil.rmtree
+        calls = {"count": 0}
+
+        def flaky(path: Path, *args, **kwargs) -> None:
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise OSError(32, "file is in use")
+            real_rmtree(path, *args, **kwargs)
+
+        with mock.patch("repopilot.execution.steps.shutil.rmtree", side_effect=flaky):
+            _force_rmtree(target, attempts=4)
+
+        assert calls["count"] == 3
+        assert not target.exists()
+
+
 # --------------------------------------------------------------- integration: engine
 
 
@@ -308,7 +351,9 @@ class TestEngineHappyPath:
 
         assert len(received) >= 6
         assert received[0].type is EventType.RUN_CREATED
-        assert received[-1] is RunStatus.SUCCEEDED
+        assert isinstance(received[-1], RunStatusUpdate)
+        assert received[-1].status is RunStatus.SUCCEEDED
+        assert received[-1].run_id == run.id
 
     async def test_a_failed_step_marks_the_run_failed(
         self, settings: Settings, fake_repo: Path
@@ -474,6 +519,53 @@ class TestEngineFailurePaths:
         final = await engine.store.require_run(run.id)
         assert final.status is RunStatus.FAILED
         assert "archived" in (final.error or "")
+
+    async def test_the_same_repository_can_be_cloned_twice(
+        self, settings: Settings, fake_repo: Path
+    ) -> None:
+        """A second run over the same repo must clear the previous checkout and succeed."""
+        engine = make_engine(settings, steps=full_pipeline(fake_repo))
+
+        first = await engine.start(repository="acme/widgets", task="first")
+        await engine.wait_for(first.id, 60)
+        assert (await engine.store.require_run(first.id)).status is RunStatus.SUCCEEDED
+
+        target = settings.workspace_dir.resolve() / "acme__widgets"
+        assert (target / ".git").is_dir()
+        # Git marks packs read-only; the replacement path has to cope with that.
+        for packed in (target / ".git" / "objects" / "pack").glob("*"):
+            packed.chmod(stat.S_IREAD)
+
+        second = await engine.start(repository="acme/widgets", task="second")
+        await engine.wait_for(second.id, 60)
+        final = await engine.store.require_run(second.id)
+
+        assert final.status is RunStatus.SUCCEEDED
+        assert final.error is None
+        assert (target / ".git").is_dir()
+
+        await engine.shutdown()
+
+    async def test_the_run_is_terminal_before_run_finished_is_announced(
+        self, settings: Settings, fake_repo: Path
+    ) -> None:
+        """An observer told the run is over must be able to read a terminal status at once."""
+        engine = make_engine(settings, steps=full_pipeline(fake_repo))
+        seen: dict[str, RunStatus] = {}
+        original = engine._emit
+
+        async def spy(run_id: str, event_type: EventType, message: str, **kwargs: object):
+            event = await original(run_id, event_type, message, **kwargs)
+            if event_type is EventType.RUN_FINISHED:
+                seen["status"] = (await engine.store.require_run(run_id)).status
+            return event
+
+        with mock.patch.object(engine, "_emit", spy):
+            run = await engine.start(repository="acme/widgets", task="t")
+            await engine.wait_for(run.id, 60)
+
+        assert seen["status"] is RunStatus.SUCCEEDED
+        await engine.shutdown()
 
 
 class TestEngineRetryLoop:
