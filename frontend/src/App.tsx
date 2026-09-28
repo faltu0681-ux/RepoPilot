@@ -4,9 +4,12 @@ import { createRun } from './api'
 import { useRunStream } from './useRunStream'
 import type {
   ExecutionEvent,
+  FailureDiagnosis,
   ImplementationPlan,
   RunStatus,
   SelectedFile,
+  TestFailure,
+  TestOutcome,
   WrittenFile,
 } from './types'
 
@@ -112,8 +115,9 @@ function Workspace({ events }: { events: ExecutionEvent[] }) {
   const plan = useMemo(() => findPlan(events), [events])
   const branch = useMemo(() => findBranch(events), [events])
   const changes = useMemo(() => collectWrittenFiles(events), [events])
+  const verification = useMemo(() => readVerification(events), [events])
 
-  if (files.length === 0 && plan === null && changes.length === 0) return null
+  if (files.length === 0 && plan === null && changes.length === 0 && !verification) return null
 
   return (
     <div className="workspace">
@@ -145,6 +149,8 @@ function Workspace({ events }: { events: ExecutionEvent[] }) {
       {plan && <PlanPanel plan={plan} />}
 
       {changes.length > 0 && <ChangesPanel changes={changes} branch={branch} />}
+
+      {verification && <VerificationPanel verification={verification} />}
     </div>
   )
 }
@@ -185,6 +191,129 @@ function ChangesPanel({
           {created} file{created === 1 ? '' : 's'} created, {changes.length - created} rewritten.
           Changes are uncommitted on this branch, waiting for the test run.
         </p>
+      )}
+    </section>
+  )
+}
+
+/**
+ * Everything known about testing, rebuilt from the event stream.
+ *
+ * Only the last `test.completed` counts as the verdict; earlier ones are the rounds that led to
+ * it, and a run that repaired a failure and then passed should read as passed, not as failed
+ * with a later footnote.
+ */
+interface Verification {
+  framework: string | null
+  command: string[]
+  suiteReason: string
+  skipped: string | null
+  outcome: TestOutcome | null
+  runs: number
+  failures: TestFailure[]
+  diagnosis: { summary: string; findings: FailureDiagnosis[]; round: number } | null
+  repairs: string[]
+  attempts: number
+}
+
+const VERDICT_LABELS: Record<string, string> = {
+  passed: 'passing',
+  failed: 'failing',
+  skipped: 'not run',
+  timeout: 'timed out',
+  unavailable: 'unavailable',
+  cancelled: 'stopped',
+}
+
+function VerificationPanel({ verification }: { verification: Verification }) {
+  const { framework, command, skipped, outcome, failures, diagnosis, repairs, attempts } =
+    verification
+  const status = outcome?.status ?? 'unknown'
+  const counts = outcome
+    ? [
+        outcome.passed !== null ? `${outcome.passed} passed` : null,
+        outcome.failed !== null ? `${outcome.failed} failed` : null,
+        outcome.errors ? `${outcome.errors} errors` : null,
+        outcome.skipped ? `${outcome.skipped} skipped` : null,
+      ].filter((part): part is string => part !== null)
+    : []
+
+  return (
+    <section className="panel">
+      <h2>
+        Verification{' '}
+        {framework && <span className={`verdict ${status}`}>{VERDICT_LABELS[status] ?? status}</span>}
+        {attempts > 1 && <span className="model">attempt {attempts}</span>}
+      </h2>
+
+      {skipped ? (
+        <p className="summary">{skipped}</p>
+      ) : (
+        <>
+          <p className="summary">
+            <code className="command">{command.join(' ')}</code>
+            {framework && ` · ${framework}`}
+            {outcome && outcome.duration_seconds > 0 && ` · ${outcome.duration_seconds.toFixed(1)}s`}
+            {verification.runs > 1 && ` · ${verification.runs} runs`}
+          </p>
+
+          {counts.length > 0 && (
+            <ul className="counts">
+              {counts.map((count) => (
+                <li key={count}>{count}</li>
+              ))}
+            </ul>
+          )}
+
+          {failures.length > 0 && (
+            <div className="block">
+              <h3>Failing tests ({failures.length})</h3>
+              <ul className="failures">
+                {failures.map((failure) => (
+                  <li key={failure.test}>
+                    <span className="test">{failure.test}</span>
+                    {failure.message && <p>{failure.message}</p>}
+                    {failure.excerpt && <pre>{failure.excerpt}</pre>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {diagnosis && (
+            <div className="block">
+              <h3>
+                Diagnosis{diagnosis.round > 1 ? ` (round ${diagnosis.round})` : ''}
+              </h3>
+              <p>{diagnosis.summary}</p>
+              <ul className="findings">
+                {diagnosis.findings.map((finding) => (
+                  <li key={`${finding.test}:${finding.path}`}>
+                    <span className={`tag ${finding.pre_existing ? 'existing' : 'repair'}`}>
+                      {finding.pre_existing ? 'pre-existing' : 'repair'}
+                    </span>
+                    <span className="test">{finding.test}</span>
+                    <span className="path">{finding.path}</span>
+                    <p>{finding.cause}</p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {repairs.length > 0 && (
+            <p className="summary">
+              Repaired {repairs.join(', ')} and ran the suite again.
+            </p>
+          )}
+
+          {outcome?.output && (
+            <details className="output">
+              <summary>Test output</summary>
+              <pre>{outcome.output}</pre>
+            </details>
+          )}
+        </>
       )}
     </section>
   )
@@ -334,8 +463,140 @@ function collectWrittenFiles(events: ExecutionEvent[]): WrittenFile[] {
   return changes
 }
 
+/**
+ * Rebuilds the verification panel from the event stream alone.
+ *
+ * Returns null until the run has said anything about testing, so a run that never reaches the
+ * test step shows no panel at all rather than an empty one. Every field is read defensively: a
+ * panel that throws on an unexpected payload would take the live view down with it.
+ */
+function readVerification(events: ExecutionEvent[]): Verification | null {
+  let framework: string | null = null
+  let command: string[] = []
+  let suiteReason = ''
+  let skipped: string | null = null
+  let outcome: TestOutcome | null = null
+  let runs = 0
+  let diagnosis: Verification['diagnosis'] = null
+  const repairs: string[] = []
+  let attempts = 1
+
+  for (const event of events) {
+    if (event.type === 'run.started') {
+      // The backend counts attempts from one, and the highest one it announced is where we are.
+      attempts = Math.max(attempts, asNumber(event.data.attempt) || 1)
+      continue
+    }
+
+    if (event.type === 'test.suite_detected') {
+      framework = asString(event.data.framework) ?? framework
+      command = asStrings(event.data.command)
+      suiteReason = asString(event.data.reason) ?? suiteReason
+      skipped = event.data.skipped === true ? (asString(event.data.reason) ?? 'no suite') : null
+      continue
+    }
+
+    if (event.type === 'test.skipped') {
+      skipped = asString(event.data.reason) ?? 'no suite'
+      continue
+    }
+
+    if (event.type === 'test.completed') {
+      runs += 1
+      outcome = {
+        framework: asString(event.data.framework) ?? framework ?? 'unknown',
+        command: asStrings(event.data.command).length ? asStrings(event.data.command) : command,
+        status: asString(event.data.status) ?? 'unknown',
+        exit_code: typeof event.data.exit_code === 'number' ? event.data.exit_code : null,
+        duration_seconds: asNumber(event.data.duration_seconds),
+        reason: asString(event.data.reason) ?? '',
+        output: asString(event.data.output) ?? '',
+        passed: asOptionalNumber(event.data.passed),
+        failed: asOptionalNumber(event.data.failed),
+        errors: asOptionalNumber(event.data.errors),
+        skipped: asOptionalNumber(event.data.skipped),
+        total: asOptionalNumber(event.data.total),
+        failures: readFailures(event.data.failures),
+      }
+      continue
+    }
+
+    if (event.type === 'failure.diagnosed') {
+      diagnosis = {
+        summary: asString(event.data.summary) ?? '',
+        findings: readFindings(event.data.findings),
+        round: Math.max(1, asNumber(event.data.round)),
+      }
+      continue
+    }
+
+    if (event.type === 'file.written' && event.data.repair === true) {
+      const path = asString(event.data.path)
+      if (path && !repairs.includes(path)) repairs.push(path)
+    }
+  }
+
+  if (framework === null && skipped === null && outcome === null && diagnosis === null) return null
+
+  return {
+    framework,
+    command,
+    suiteReason,
+    skipped,
+    outcome,
+    runs,
+    failures: outcome?.failures ?? [],
+    diagnosis,
+    repairs,
+    attempts,
+  }
+}
+
+function readFailures(value: unknown): TestFailure[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => {
+      if (typeof item !== 'object' || item === null) return null
+      const record = item as Record<string, unknown>
+      const test = asString(record.test)
+      if (!test) return null
+      return {
+        test,
+        message: asString(record.message) ?? '',
+        excerpt: asString(record.excerpt) ?? '',
+      }
+    })
+    .filter((failure): failure is TestFailure => failure !== null)
+}
+
+function readFindings(value: unknown): FailureDiagnosis[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => {
+      if (typeof item !== 'object' || item === null) return null
+      const record = item as Record<string, unknown>
+      const test = asString(record.test)
+      const path = asString(record.path)
+      if (!test || !path) return null
+      return {
+        test,
+        path,
+        cause: asString(record.cause) ?? '',
+        pre_existing: record.pre_existing === true,
+        bytes: asNumber(record.bytes),
+        actionable: record.actionable !== false,
+      }
+    })
+    .filter((finding): finding is FailureDiagnosis => finding !== null)
+}
+
 function asString(value: unknown): string | null {
   return typeof value === 'string' ? value : null
+}
+
+/** A count the backend reported as "not measurable" stays absent rather than becoming a zero. */
+function asOptionalNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 function asNumber(value: unknown): number {

@@ -321,6 +321,20 @@ def _looks_like_preamble(line: str) -> bool:
     return any(line.startswith(marker) for marker in _PREAMBLE_STARTS)
 
 
+def validate_whole_file(content: str, *, current: str = "", path: str = "the file") -> str:
+    """Check that ``content`` really is the whole file, and return it normalised.
+
+    The same rules the implementer's replies go through, exposed for Phase 2C: a repair arrives as
+    one field of a larger JSON object rather than as the whole reply, but it lands on disk exactly
+    the same way, so it is held to exactly the same standard. A partial file is a syntax error at
+    best and a silent deletion at worst.
+    """
+    try:
+        return _reject_elision(content, current)
+    except ChangeRejectedError as exc:
+        raise ChangeRejectedError(f"refusing to write {path}: {exc}") from exc
+
+
 def _reject_elision(content: str, current: str) -> str:
     """Reject a body that claims to be a summary of a file rather than the file."""
     if not content.strip():

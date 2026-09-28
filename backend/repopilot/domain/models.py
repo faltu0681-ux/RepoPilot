@@ -65,6 +65,12 @@ class EventType(StrEnum):
     # Phase 2B. The plan turning into real files in the run's isolated workspace.
     BRANCH_CREATED = "branch.created"
     FILE_WRITTEN = "file.written"
+    # Phase 2C. The change being proved, and what its failures mean.
+    TEST_SUITE_DETECTED = "test.suite_detected"
+    TEST_STARTED = "test.started"
+    TEST_COMPLETED = "test.completed"
+    TEST_SKIPPED = "test.skipped"
+    FAILURE_DIAGNOSED = "failure.diagnosed"
 
 
 class EventLevel(StrEnum):

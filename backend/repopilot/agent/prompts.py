@@ -12,6 +12,7 @@ from pathlib import Path
 from repopilot.agent.schema import ImplementationPlan, PlanStep
 from repopilot.analysis.profile import RepositoryProfile
 from repopilot.analysis.relevance import CandidateFile, snippet
+from repopilot.analysis.testing import TestOutcome
 
 PLANNER_SYSTEM = """\
 You are RepoPilot, a senior engineer planning a change to an existing codebase.
@@ -68,6 +69,46 @@ says to, and do not leave a placeholder, a TODO, or a stub where working code wa
 - Never write a secret, credential, token, or key into a file, and never target a .env file.
 - The plan is a plan, not gospel. If it names a symbol that is not in the file you were given, \
 implement the intent against what is actually there.
+"""
+
+
+DIAGNOSER_SYSTEM = """\
+You are RepoPilot, a senior engineer looking at a test suite that just failed after a change was \
+applied to a real checkout. You are given the failure output and the files that were changed, and \
+you return a diagnosis.
+
+Hard rules:
+- The failure output is your only evidence. Read it before deciding anything, and do not claim a \
+cause the output does not support.
+- Only the files listed as changed by this run are yours to fix. If the honest fix is in another \
+file, name that file in "path" anyway and explain in "cause" that it is outside this run; the run \
+will refuse the change and say so rather than write it.
+- Return the complete new contents of the file you are fixing, verbatim, as the "content" field. \
+Never a diff, never a fragment, never "..." or "rest of the file unchanged": what you return is \
+written to disk as the whole file.
+- If the failure cannot be caused by these changes, say so: set "pre_existing" to true and leave \
+"content" empty. A repository that was already broken is reported, not rewritten.
+- Never make a failing test pass by weakening it. Do not delete a test, lower an assertion, skip a \
+case, or catch the exception the test is there to catch. If the test is genuinely wrong, say so in \
+"cause" and return the fixed source, not the fixed test.
+- Fix the cause, not the symptom, and keep the change as small as the cause allows. Do not \
+refactor, reformat, or touch code the failure does not point at.
+- Never write a secret, credential, token, or key, and never target a .env file.
+
+Reply with one JSON object and nothing else:
+
+{
+  "summary": "one paragraph: what is failing and why",
+  "findings": [
+    {
+      "test": "the failing test, as the runner named it",
+      "path": "a file to rewrite, or the file the fix belongs in even if you may not write it",
+      "cause": "what in the code causes this failure, and the specific change that fixes it",
+      "pre_existing": false,
+      "content": "the complete new contents of that file, or an empty string"
+    }
+  ]
+}
 """
 
 
@@ -220,5 +261,74 @@ def build_implementer_prompt(
 
     return [
         ("system", IMPLEMENTER_SYSTEM),
+        ("user", "\n".join(sections)),
+    ]
+
+
+#: A repair round quotes the failing output and the files it may rewrite, and both are capped:
+#: the output is trimmed to its end by the caller, and a file too large to quote is named without
+#: its contents rather than truncated into something the model would copy.
+DIAGNOSIS_SNIPPET_CHARS = 12_000
+
+
+def build_diagnoser_prompt(
+    *,
+    task: str,
+    repository: str,
+    outcome: TestOutcome,
+    files: list[tuple[str, str | None]],
+    round_number: int,
+    previous: str = "",
+) -> list[tuple[str, str]]:
+    """Build the chat turns that ask why the suite failed and what would fix it.
+
+    ``files`` is the run's own changes as ``(path, contents)``, with ``None`` for a file too
+    large to quote. Only those paths may be written back, so the inventory is both the evidence
+    and the boundary: the model is told the limit rather than discovering it.
+    """
+    sections = [
+        f"Repository: {repository}",
+        "",
+        f"Task from the user:\n{task}",
+        "",
+        f"The {outcome.framework} suite failed. Command: {outcome.as_command_text()}",
+        f"Exit status: {outcome.exit_code}, after {outcome.duration_seconds:.1f}s",
+    ]
+    if outcome.tally.failures:
+        sections.append("")
+        sections.append("Failing tests:")
+        for failure in outcome.tally.failures:
+            detail = f" - {failure.message}" if failure.message else ""
+            sections.append(f"- {failure.test}{detail}")
+    if outcome.output:
+        sections += [
+            "",
+            "Output (the end of the run):",
+            "-----",
+            outcome.output,
+            "-----",
+        ]
+    if previous:
+        sections += [
+            "",
+            "A previous repair round did not make the suite pass. It is still failing as shown "
+            f"above. That earlier attempt said: {previous}",
+        ]
+
+    sections += ["", "Files this run changed, and the only files you may return contents for:"]
+    for path, contents in files:
+        if contents is None:
+            sections.append(f"- {path} (too large to quote here; you may still return it)")
+        else:
+            sections += ["", f"Current contents of {path}:", "-----", contents, "-----"]
+        sections.append(f"^^ {path}")
+
+    sections += [
+        "",
+        f"Diagnose the failure (repair round {round_number}) and reply with the JSON object "
+        "described in your instructions.",
+    ]
+    return [
+        ("system", DIAGNOSER_SYSTEM),
         ("user", "\n".join(sections)),
     ]

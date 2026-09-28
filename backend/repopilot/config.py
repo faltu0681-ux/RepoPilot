@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     # --- Workspace ---
     workspace_dir: Path = Path(".repopilot-data")
 
+    # --- Verification (Phase 2C) ---
+    # A test suite belongs to another project and may well be slower than RepoPilot's own
+    # requests, so this is its own ceiling rather than a share of llm_timeout. Ten minutes suits a
+    # suite that boots a database; the cap exists so a hung suite ends the run instead of
+    # holding a worker open forever.
+    test_timeout_seconds: float = Field(default=600.0, gt=0.0, le=7200.0)
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _parse_cors_origins(cls, value: Any) -> Any:

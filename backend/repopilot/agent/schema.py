@@ -12,6 +12,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+#: A repair round names at most this many failing tests. Past that the suite is failing for one
+#: reason, and twenty findings is already more than a prompt should carry.
+MAX_DIAGNOSED_FAILURES = 20
+
+#: Matches the writer's own ceiling in :mod:`repopilot.agent.implement`, so a body the model
+#: produced is never rejected later for being too large to be a file.
+MAX_DIAGNOSED_FILE_CHARS = 200_000
+
 
 class PlanStep(BaseModel):
     """One thing to do, in the order it should be done."""
@@ -128,4 +136,62 @@ class FileChange(BaseModel):
             "role": self.role,
             "bytes": self.byte_size,
             "lines": self.line_count,
+        }
+
+
+class FailureDiagnosis(BaseModel):
+    """One failing test, what the model thinks caused it, and the file that would fix it.
+
+    ``pre_existing`` is the field that stops the repair loop from chasing a failure the run did
+    not cause: a repository that was already broken stays reported rather than being rewritten
+    twice in a row in the hope of fixing someone else's bug. A finding marked pre-existing is
+    expected to carry no ``content``, because there is nothing to write.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    test: str = Field(min_length=1, max_length=400)
+    path: str = Field(min_length=1)
+    cause: str = Field(min_length=1, max_length=2000)
+    pre_existing: bool = False
+    content: str = Field(default="", max_length=MAX_DIAGNOSED_FILE_CHARS)
+
+    @property
+    def actionable(self) -> bool:
+        return not self.pre_existing and self.content.strip() != ""
+
+    def as_dict(self) -> dict[str, Any]:
+        """The metadata an event may carry. The corrected body stays on disk, not in the stream."""
+        return {
+            "test": self.test,
+            "path": self.path,
+            "cause": self.cause,
+            "pre_existing": self.pre_existing,
+            "bytes": len(self.content.encode("utf-8")),
+            "actionable": self.actionable,
+        }
+
+
+class TestFailureReport(BaseModel):
+    """What the model concluded about a failing suite, for one repair round."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1, max_length=4000)
+    findings: list[FailureDiagnosis] = Field(max_length=MAX_DIAGNOSED_FAILURES)
+    model: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+    def actionable(self) -> list[FailureDiagnosis]:
+        """The findings that name a fix, in the order the model listed them."""
+        return [finding for finding in self.findings if finding.actionable]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "summary": self.summary,
+            "findings": [finding.as_dict() for finding in self.findings],
+            "actionable": len(self.actionable()),
+            "pre_existing": sum(1 for finding in self.findings if finding.pre_existing),
+            "model": self.model,
         }

@@ -26,6 +26,7 @@ from repopilot.domain.models import (
 )
 from repopilot.domain.store import RunStore
 from repopilot.execution.bus import EventBus
+from repopilot.execution.sandbox import ShellSandbox
 from repopilot.execution.steps import (
     RunServices,
     Step,
@@ -221,6 +222,9 @@ class RunEngine:
             github=self._github,
             workspace=self._settings.workspace_dir.resolve(),
             llm=self._llm,
+            # One sandbox for the whole attempt, carrying the configured ceiling: a suite that
+            # hangs must not be able to hang the run, and the limit belongs in one place.
+            sandbox=ShellSandbox(default_timeout=self._settings.test_timeout_seconds),
         )
         state: dict = {}
         reason = "pipeline completed"
@@ -239,6 +243,7 @@ class RunEngine:
                 emit=self._make_emitter(run_id, step.name, index, len(self._steps)),
                 is_cancelled=lambda: self._is_cancelled(run_id),
                 attempt=attempt,
+                max_attempts=MAX_ATTEMPTS,
                 state=state,
             )
             try:

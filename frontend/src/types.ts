@@ -31,6 +31,11 @@ export type EventType =
   | 'plan.created'
   | 'branch.created'
   | 'file.written'
+  | 'test.suite_detected'
+  | 'test.started'
+  | 'test.completed'
+  | 'test.skipped'
+  | 'failure.diagnosed'
 
 export type EventLevel = 'debug' | 'info' | 'warn' | 'error'
 
@@ -83,6 +88,51 @@ export interface WrittenFile {
   lines: number
   created: boolean
   branch: string | null
+  /** Set on a file the diagnosis step repaired after a failing suite (Phase 2C). */
+  repair?: boolean
+  round?: number
+}
+
+/**
+ * What the run decided to do about testing, read from the `test.*` events rather than from a
+ * second API. Kept deliberately flat: the events are the record, and a panel that has to be
+ * reconciled with them is a panel that can quietly disagree with them.
+ */
+export type TestVerdict = 'passed' | 'failed' | 'skipped' | 'timeout' | 'unavailable' | 'cancelled'
+
+/** Mirrors `repopilot.analysis.testing.TestFailure`. */
+export interface TestFailure {
+  test: string
+  message: string
+  excerpt: string
+}
+
+/** Mirrors `repopilot.analysis.testing.TestOutcome`, the payload of `test.completed`. */
+export interface TestOutcome {
+  framework: string
+  command: string[]
+  status: TestVerdict | string
+  exit_code: number | null
+  duration_seconds: number
+  reason: string
+  /** The tail of the run's output, trimmed by the backend. */
+  output: string
+  passed: number | null
+  failed: number | null
+  errors: number | null
+  skipped: number | null
+  total: number | null
+  failures: TestFailure[]
+}
+
+/** Mirrors `repopilot.agent.schema.FailureDiagnosis`, as carried by `failure.diagnosed`. */
+export interface FailureDiagnosis {
+  test: string
+  path: string
+  cause: string
+  pre_existing: boolean
+  bytes: number
+  actionable: boolean
 }
 
 export interface ExecutionEvent {

@@ -12,12 +12,17 @@ GitHub repo -> Create Run -> Execution state -> Live events -> WebSocket -> Term
 
 ## Status
 
-**Phase 2B - plan to real files.** A run now plans the change and then writes it: it creates a
-branch inside its own checkout and asks the model for the new contents of every file the plan
-marked to be modified or created. Nothing is committed and no tests are run yet (2C), so a run
-ends with real changes sitting uncommitted on its branch.
+**Phase 2C - proving the change.** A run now finishes its work by running the repository's own
+test suite and reading the result. It detects the runner from the files the repo actually
+declares, executes it in the run's checkout, reports the verdict live, and when tests fail it
+asks the model what broke and repairs up to two times, re-running the suite after each repair.
+A failure it cannot explain ends the run with the reason instead of a silent retry loop.
+
+Nothing is committed and no pull request is opened (2D), so a run ends with changes and a
+verdict, sitting uncommitted on its branch.
 
     validate -> resolve -> clone -> inspect -> profile -> select_files -> plan -> apply_plan
+    -> test -> diagnose
 
 | Milestone | What it adds | Status |
 | --- | --- | --- |
@@ -33,8 +38,8 @@ ends with real changes sitting uncommitted on its branch.
 | 10 | Pluggable LLM client and structured implementation plan | done |
 | 11 | Plan and discovered files in the terminal UI | done |
 | 12 | Edit files on a branch in the run workspace (2B) | done |
-| 13 | Test detection, execution, failure diagnosis, retry (2C) | next |
-| 14 | Structured run summary with VERIFIED / FAILED (2D) | planned |
+| 13 | Test detection, execution, failure diagnosis, retry (2C) | done |
+| 14 | Structured run summary with VERIFIED / FAILED (2D) | next |
 
 Every seam the rest of the agent needs already exists: `StepOutcome.RETRY` plus `Run.attempts`
 is the fix loop, `RunServices` is where the sandbox goes, and each agent capability is one more
@@ -171,17 +176,18 @@ in the project root. See `.env.example`.
 | `REPOPILOT_LLM_BASE_URL` | _empty_ | Provider endpoint. Empty means "no reasoning backend" |
 | `REPOPILOT_LLM_MODEL` | _empty_ | Model name. Empty means "no reasoning backend" |
 | `REPOPILOT_LLM_DIALECT` | `openai` | `openai` for any OpenAI-compatible API, or `anthropic` |
+| `REPOPILOT_TEST_TIMEOUT_SECONDS` | `600` | Wall-clock limit for one test suite run. `0 < value <= 7200` |
 
 **`.env` is gitignored and must never be committed.** No tokens, keys, or credentials belong
 in this repository. If you add a secret-handling path later, read it from the environment only.
 
 ### Configuring the reasoning backend
 
-Phase 2A and 2B need a model: it writes the implementation plan and the new contents of each
-file. `REPOPILOT_LLM_MODEL` and `REPOPILOT_LLM_BASE_URL` both default to empty, which means
-*unconfigured*. That is on purpose: with no default endpoint, a fresh install never builds a
-client and never makes a network call. A run that needs reasoning fails with a message naming
-these settings.
+Phase 2A, 2B, and 2C need a model: it writes the implementation plan, the new contents of each
+file, and the diagnosis of a failing test. `REPOPILOT_LLM_MODEL` and `REPOPILOT_LLM_BASE_URL`
+both default to empty, which means *unconfigured*. That is on purpose: with no default endpoint, a
+fresh install never builds a client and never makes a network call. A run that needs reasoning
+fails with a message naming these settings.
 
 Copy `.env.example` to `.env` and fill in whichever provider you have:
 
@@ -238,10 +244,16 @@ from the event stream, so a reconnecting browser rebuilds them from the replayed
   the files to change tagged `modify` / `add` / `read`, risks, and token usage.
 - **Changes applied** appears as the `apply_plan` step streams its `file.written` events, one row
   per file with `new` or `edit`, its new line and byte counts, and the branch it was written on.
+- **Verification** appears when the run reaches the test step: the runner it chose and the exact
+  command, the verdict, the pass/fail counts, the failing tests with their output excerpts, and
+  then the diagnosis and which files were repaired to get there. A run whose repository declares
+  no test runner, or whose runner is not installed, says so instead of showing an empty verdict.
 
 No panel fetches anything the backend did not already report, so what you read here is exactly
 what the run did. The file bodies are deliberately not in the events: events are persisted and
-replayed to every client, and a source file has no business in one.
+replayed to every client, and a source file has no business in one. The same goes for a repair,
+which reports as a `file.written` event flagged `repair`, so the UI can show that a file changed
+twice without ever seeing either version.
 
 ```bash
 npm run lint      # oxlint
@@ -275,15 +287,15 @@ backend/repopilot/
   config.py        Environment-based settings
   domain/          Pure data: Run, RunStatus, ExecutionEvent, RunEventType
   execution/       Engine, event bus, step pipeline (the pluggable agent seam)
-  analysis/        Deterministic repo inspection: profile.py, relevance.py. No model.
-  agent/           Model-driven reasoning: llm.py, prompts.py, plan.py, implement.py, schema.py
+  analysis/        Deterministic repo inspection: profile.py, relevance.py, testing.py
+  agent/           Model-driven reasoning: llm.py, prompts.py, plan.py, implement.py, diagnose.py
   github/          GitHub client (repo metadata, clone, PR creation)
   api/             HTTP routes and the WebSocket endpoint
 frontend/
   src/types.ts     Wire types mirroring the backend frames
   src/api.ts       REST client
   src/useRunStream.ts  WebSocket subscription: cursor, resync, reconnect
-  src/App.tsx      Form, live terminal, discovered files, plan and changes panels
+  src/App.tsx      Form, live terminal, discovered files, plan, changes and verification panels
 tests/             pytest suite
 ```
 
@@ -326,6 +338,60 @@ writes anything. Three rules are enforced there rather than requested in a promp
 Files are written with the bytes the model produced (`newline=""`, so Windows does not rewrite
 line endings), parent directories are created for new files, and nothing is committed: the
 changes stay in the working tree on the run's branch for the test step to run against.
+
+### Running the tests
+
+The `test` step answers one question: does the repository have a test suite, and does it pass?
+
+`analysis/testing.py` picks a runner from evidence in the checkout rather than from the model. A
+`pyproject.toml` with pytest, a `package.json` with a test script, a `go.mod`, a `Cargo.toml`, a
+Maven or Gradle build, each name a framework and a fixed argv; the first one that matches wins
+and the reason is streamed in the `test.suite_detected` event, so a wrong guess is visible rather
+than silent. A repository that declares no runner emits `test.skipped` and the run finishes
+without pretending to have verified anything.
+
+`execution/sandbox.py` runs the argv. It is not a security boundary: it exists to make the test
+step *well behaved*, not safe. It runs a fixed argument vector with no shell, in the run's own
+checkout and nothing else; it kills the whole process tree if the run is cancelled; it stops at
+`REPOPILOT_TEST_TIMEOUT_SECONDS` (600 by default) rather than hanging; and it keeps the tail of
+the output rather than buffering all of it. The repository's test suite executes with the
+permissions of the RepoPilot process, so run RepoPilot on code you are willing to execute.
+
+The output is then parsed into counts and named failures. Parsing is the weakest part of any
+such system, so the step is built to be honest when it is wrong: a runner that prints a tally
+gets one, a runner that does not reports `null` rather than a fabricated zero, and a nonzero exit
+with no recognisable failure list is reported as a failure of the suite itself instead of being
+passed off as a clean run.
+
+### Diagnosing a failure
+
+A failing suite is not an error yet. The `diagnose` step exists to answer "what broke, and was
+it something this run did?"
+
+The model is shown the failing test names, the output excerpts, and the contents of the files
+**this run wrote** - nothing else. It returns a `FailureDiagnosis` per test with a cause and
+either a whole-file replacement or an honest "pre-existing". The reply is validated against
+`agent/schema.py` and retried once if it will not parse, and the same whole-file check the
+implementer uses is applied to any proposed content.
+
+The rules that keep this from becoming a loop that rewrites the repository are structural:
+
+- **A repair may only touch a file the run already wrote.** The prompt lists them, and the paths
+  in the reply are re-checked against that list before anything is opened for writing. A model
+  that decides the bug is somewhere else gets to say so, not edit there.
+- **Bounded rounds.** At most two repairs per run, and the suite is re-run after each one, so
+  the verdict reported at the end is the verdict of the code that is actually on disk.
+- **A refused repair is not a repair.** Content that is not a whole file, or that leaves a file
+  byte-identical, is rejected with a reason and the round is spent. The model cannot pass off a
+  no-op as progress.
+- **Pre-existing failures are reported, not fixed.** If the model attributes the failure to code
+  the run never touched, that is the end of the diagnosis, stated as such.
+- **Exhaustion is an honest outcome.** If the suite still fails after the rounds, the run asks
+  for another attempt; if this was the last attempt, it fails with the reason, the round count,
+  and the output already in the event stream.
+
+One thing to be clear about: diagnosing a failure needs the model, so a run that fails its tests
+with no reasoning backend configured ends at the verdict rather than in a repair loop.
 
 ## License
 
