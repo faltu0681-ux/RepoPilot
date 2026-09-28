@@ -12,11 +12,12 @@ GitHub repo -> Create Run -> Execution state -> Live events -> WebSocket -> Term
 
 ## Status
 
-**Phase 2A - issue to plan.** A run now reads a real repository and produces a real, grounded
-implementation plan for a natural-language task. It still does not edit anything: writing code
-(2B) and running the project's tests (2C) are not implemented yet.
+**Phase 2B - plan to real files.** A run now plans the change and then writes it: it creates a
+branch inside its own checkout and asks the model for the new contents of every file the plan
+marked to be modified or created. Nothing is committed and no tests are run yet (2C), so a run
+ends with real changes sitting uncommitted on its branch.
 
-    validate -> resolve -> clone -> inspect -> profile -> select_files -> plan
+    validate -> resolve -> clone -> inspect -> profile -> select_files -> plan -> apply_plan
 
 | Milestone | What it adds | Status |
 | --- | --- | --- |
@@ -31,13 +32,13 @@ implementation plan for a natural-language task. It still does not edit anything
 | 9 | Task-to-file relevance ranking, no model involved | done |
 | 10 | Pluggable LLM client and structured implementation plan | done |
 | 11 | Plan and discovered files in the terminal UI | done |
-| 12 | Edit files on a branch in the run workspace (2B) | next |
-| 13 | Test detection, execution, failure diagnosis, retry (2C) | planned |
+| 12 | Edit files on a branch in the run workspace (2B) | done |
+| 13 | Test detection, execution, failure diagnosis, retry (2C) | next |
 | 14 | Structured run summary with VERIFIED / FAILED (2D) | planned |
 
 Every seam the rest of the agent needs already exists: `StepOutcome.RETRY` plus `Run.attempts`
-is the fix loop, `RunServices` is where the sandbox and diff writer go, and each agent
-capability is one more entry in `default_pipeline()`.
+is the fix loop, `RunServices` is where the sandbox goes, and each agent capability is one more
+entry in `default_pipeline()`.
 
 ## Requirements
 
@@ -176,10 +177,11 @@ in this repository. If you add a secret-handling path later, read it from the en
 
 ### Configuring the reasoning backend
 
-Phase 2A needs a model to write the implementation plan. `REPOPILOT_LLM_MODEL` and
-`REPOPILOT_LLM_BASE_URL` both default to empty, which means *unconfigured*. That is on purpose:
-with no default endpoint, a fresh install never builds a client and never makes a network call.
-A run that needs reasoning fails with a message naming these settings.
+Phase 2A and 2B need a model: it writes the implementation plan and the new contents of each
+file. `REPOPILOT_LLM_MODEL` and `REPOPILOT_LLM_BASE_URL` both default to empty, which means
+*unconfigured*. That is on purpose: with no default endpoint, a fresh install never builds a
+client and never makes a network call. A run that needs reasoning fails with a message naming
+these settings.
 
 Copy `.env.example` to `.env` and fill in whichever provider you have:
 
@@ -227,16 +229,19 @@ Start the backend first, then open the page, enter a repository and a task, and 
 Events stream in live and the panel follows the tail until you scroll up, at which point it stops
 chasing so you can read.
 
-Below the terminal, two panels fill in as the run discovers things, and both are derived purely
+Below the terminal, three panels fill in as the run works, and all of them are derived purely
 from the event stream, so a reconnecting browser rebuilds them from the replayed events alone:
 
 - **Discovered files** appears as the `select_files` step streams its `file.selected` events, one
   row per file with its score, language, line count, and the reasons it was chosen.
 - **Implementation plan** appears on `plan.created`, with the summary, approach, numbered steps,
   the files to change tagged `modify` / `add` / `read`, risks, and token usage.
+- **Changes applied** appears as the `apply_plan` step streams its `file.written` events, one row
+  per file with `new` or `edit`, its new line and byte counts, and the branch it was written on.
 
-Neither panel fetches anything the backend did not already report, so what you read here is
-exactly what the run did.
+No panel fetches anything the backend did not already report, so what you read here is exactly
+what the run did. The file bodies are deliberately not in the events: events are persisted and
+replayed to every client, and a source file has no business in one.
 
 ```bash
 npm run lint      # oxlint
@@ -271,14 +276,14 @@ backend/repopilot/
   domain/          Pure data: Run, RunStatus, ExecutionEvent, RunEventType
   execution/       Engine, event bus, step pipeline (the pluggable agent seam)
   analysis/        Deterministic repo inspection: profile.py, relevance.py. No model.
-  agent/           Model-driven reasoning: llm.py, prompts.py, plan.py, schema.py
+  agent/           Model-driven reasoning: llm.py, prompts.py, plan.py, implement.py, schema.py
   github/          GitHub client (repo metadata, clone, PR creation)
   api/             HTTP routes and the WebSocket endpoint
 frontend/
   src/types.ts     Wire types mirroring the backend frames
   src/api.ts       REST client
   src/useRunStream.ts  WebSocket subscription: cursor, resync, reconnect
-  src/App.tsx      Form, live terminal, discovered files, plan panel
+  src/App.tsx      Form, live terminal, discovered files, plan and changes panels
 tests/             pytest suite
 ```
 
@@ -301,6 +306,26 @@ validated against `agent/schema.py`, retried once if it will not parse, and ever
 references is checked against files that actually exist. Paths with role `add` are kept, because
 a plan is allowed to propose new files; anything else that is missing is dropped and recorded in
 the plan's risks. A model that invents `src/app.py` cannot steer the run towards it.
+
+### What a write is allowed to do
+
+`agent/implement.py` is where a plan becomes files, and it is the only code in the project that
+writes anything. Three rules are enforced there rather than requested in a prompt:
+
+- **One file per call.** The run decides the path and the role; the model is only asked for the
+  body. There is no path in the reply to hallucinate, and a file the model gets wrong costs that
+  file rather than the whole change.
+- **The path is re-checked before every write.** Absolute paths, `..`, anything under `.git`,
+  credential files (`.env`, `*.pem`, `id_rsa`, and friends), and anything that resolves outside
+  the run's checkout are refused, and a refused path is recorded and skipped rather than
+  written. Symlink escapes are caught by resolving before the containment test.
+- **The content has to be a whole file.** A reply that opens with prose, carries an unclosed code
+  fence, elides the rest of the file, or is byte-identical to what it was asked to change is
+  rejected with a reason and asked for once more, not written.
+
+Files are written with the bytes the model produced (`newline=""`, so Windows does not rewrite
+line endings), parent directories are created for new files, and nothing is committed: the
+changes stay in the working tree on the run's branch for the test step to run against.
 
 ## License
 

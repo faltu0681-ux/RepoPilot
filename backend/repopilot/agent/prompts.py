@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from repopilot.agent.schema import ImplementationPlan, PlanStep
 from repopilot.analysis.profile import RepositoryProfile
 from repopilot.analysis.relevance import CandidateFile, snippet
 
@@ -49,6 +50,25 @@ Respond with a single JSON object and nothing else. Shape:
 #: Cap on the number of candidates whose contents are quoted into the prompt.
 SNIPPET_BUDGET_CHARS = 60_000
 MAX_SNIPPET_FILES = 12
+
+IMPLEMENTER_SYSTEM = """\
+You are RepoPilot, a senior engineer applying an approved implementation plan to a real \
+checkout. You are given one file and you return that file's new contents.
+
+Hard rules:
+- Reply with the complete new contents of the file you were asked about, and nothing else. No \
+preamble, no explanation, no markdown code fence, no comments about being an AI.
+- Output the whole file. Never a fragment, never a diff, never an elision: writing "..." or \
+"# rest of the file unchanged" is a failure, because what you return is written to disk verbatim.
+- Preserve the file's existing style exactly: indentation, naming, comment density, import order, \
+and line length. Make the smallest change that satisfies the task and keep everything the task \
+did not ask you to change.
+- Keep the file working on its own terms: do not rename or delete public symbols unless the task \
+says to, and do not leave a placeholder, a TODO, or a stub where working code was.
+- Never write a secret, credential, token, or key into a file, and never target a .env file.
+- The plan is a plan, not gospel. If it names a symbol that is not in the file you were given, \
+implement the intent against what is actually there.
+"""
 
 
 def _inventory_lines(profile: RepositoryProfile, candidates: list[CandidateFile]) -> list[str]:
@@ -126,5 +146,79 @@ the profile plausibly relates to the task, set relevant_files to [] and explain 
 
     return [
         ("system", PLANNER_SYSTEM),
+        ("user", "\n".join(sections)),
+    ]
+
+
+def _plan_steps_for(plan: ImplementationPlan, path: str) -> list[PlanStep]:
+    return [step for step in plan.steps if path in step.files]
+
+
+def build_implementer_prompt(
+    *,
+    task: str,
+    repository: str,
+    plan: ImplementationPlan,
+    path: str,
+    role: str,
+    current: str,
+    siblings: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Build the chat turns that ask for one file's new contents.
+
+    The plan is included in condensed form rather than whole: the step that touches this file,
+    why the plan picked it, and the other files this run is changing, so the model writes
+    against the same names the rest of the change uses.
+    """
+    reason = next(
+        (f.reason for f in plan.relevant_files if f.path == path),
+        "",
+    )
+    steps = _plan_steps_for(plan, path)
+
+    sections = [
+        f"Repository: {repository}",
+        "",
+        f"Task from the user:\n{task}",
+        "",
+        "Implementation plan you are applying:",
+        f"- summary: {plan.summary}",
+    ]
+    if plan.approach:
+        sections.append(f"- approach: {plan.approach}")
+    if reason:
+        sections.append(f"- {path} ({role}): {reason}")
+    for step in steps:
+        detail = f" - {step.detail}" if step.detail else ""
+        sections.append(f"- step {step.order}: {step.title}{detail}")
+
+    if siblings:
+        sections += [
+            "",
+            "Other files this same run is changing. Do not write them here, but keep names, "
+            "imports, and signatures consistent with them: " + ", ".join(siblings),
+        ]
+
+    if current:
+        sections += [
+            "",
+            f"Current contents of {path}, exactly as they are on disk:",
+            "-----",
+            current,
+            "-----",
+            "",
+            f"Return the new contents of {path}. Output only the file.",
+        ]
+    else:
+        sections += [
+            "",
+            f"{path} does not exist yet. Create it, complete and runnable, with whatever "
+            "imports, types, and docstring the surrounding code implies.",
+            "",
+            f"Return the contents of the new {path}. Output only the file.",
+        ]
+
+    return [
+        ("system", IMPLEMENTER_SYSTEM),
         ("user", "\n".join(sections)),
     ]

@@ -7,6 +7,7 @@ import type {
   ImplementationPlan,
   RunStatus,
   SelectedFile,
+  WrittenFile,
 } from './types'
 
 const SAMPLE_REPOSITORY = 'octocat/Hello-World'
@@ -99,7 +100,8 @@ export default function App() {
 }
 
 /**
- * Renders what the run found: the files it considered, and the plan it produced.
+ * Renders what the run found and what it changed: the files it considered, the plan it made,
+ * and the files it actually wrote.
  *
  * Everything here is derived from the event stream, so a reconnecting client rebuilds the
  * whole panel from the replayed events alone. There is no second source of truth to keep in
@@ -108,8 +110,10 @@ export default function App() {
 function Workspace({ events }: { events: ExecutionEvent[] }) {
   const files = useMemo(() => collectSelectedFiles(events), [events])
   const plan = useMemo(() => findPlan(events), [events])
+  const branch = useMemo(() => findBranch(events), [events])
+  const changes = useMemo(() => collectWrittenFiles(events), [events])
 
-  if (files.length === 0 && plan === null) return null
+  if (files.length === 0 && plan === null && changes.length === 0) return null
 
   return (
     <div className="workspace">
@@ -139,7 +143,50 @@ function Workspace({ events }: { events: ExecutionEvent[] }) {
       )}
 
       {plan && <PlanPanel plan={plan} />}
+
+      {changes.length > 0 && <ChangesPanel changes={changes} branch={branch} />}
     </div>
+  )
+}
+
+/** What the run wrote, on which branch. The bodies are not in the event stream, by design. */
+function ChangesPanel({
+  changes,
+  branch,
+}: {
+  changes: WrittenFile[]
+  branch: string | null
+}) {
+  const created = changes.filter((file) => file.created).length
+
+  return (
+    <section className="panel">
+      <h2>
+        Changes applied <span className="count">{changes.length}</span>
+        {branch && <span className="model">{branch}</span>}
+      </h2>
+
+      <ul className="files changes">
+        {changes.map((file) => (
+          <li key={file.path}>
+            <span className={`score ${file.created ? 'new' : 'edit'}`}>
+              {file.created ? 'new' : 'edit'}
+            </span>
+            <span className="path">{file.path}</span>
+            <span className="facts">
+              {file.lines} lines · {file.bytes} bytes
+            </span>
+          </li>
+        ))}
+      </ul>
+
+      {created > 0 && (
+        <p className="summary">
+          {created} file{created === 1 ? '' : 's'} created, {changes.length - created} rewritten.
+          Changes are uncommitted on this branch, waiting for the test run.
+        </p>
+      )}
+    </section>
   )
 }
 
@@ -251,6 +298,40 @@ function findPlan(events: ExecutionEvent[]): ImplementationPlan | null {
     if (plan && typeof plan === 'object') return plan as ImplementationPlan
   }
   return null
+}
+
+/** The branch the run created, if it got that far. */
+function findBranch(events: ExecutionEvent[]): string | null {
+  for (const event of events) {
+    if (event.type !== 'branch.created') continue
+    const branch = asString(event.data.branch)
+    if (branch) return branch
+  }
+  return null
+}
+
+/** Collect the written files, in the order the backend announced them. */
+function collectWrittenFiles(events: ExecutionEvent[]): WrittenFile[] {
+  const changes: WrittenFile[] = []
+  const seen = new Set<string>()
+
+  for (const event of events) {
+    if (event.type !== 'file.written') continue
+    const path = asString(event.data.path)
+    if (!path || seen.has(path)) continue
+    seen.add(path)
+    const role = event.data.role
+    changes.push({
+      path,
+      role: role === 'add' ? 'add' : 'modify',
+      bytes: asNumber(event.data.bytes),
+      lines: asNumber(event.data.lines),
+      created: event.data.created === true,
+      branch: asString(event.data.branch),
+    })
+  }
+
+  return changes
 }
 
 function asString(value: unknown): string | null {

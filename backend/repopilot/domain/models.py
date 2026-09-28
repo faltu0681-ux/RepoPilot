@@ -62,6 +62,9 @@ class EventType(StrEnum):
     # Phase 2. Discovery and planning facts, streamed so the terminal can render them.
     FILE_SELECTED = "file.selected"
     PLAN_CREATED = "plan.created"
+    # Phase 2B. The plan turning into real files in the run's isolated workspace.
+    BRANCH_CREATED = "branch.created"
+    FILE_WRITTEN = "file.written"
 
 
 class EventLevel(StrEnum):

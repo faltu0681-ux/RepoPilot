@@ -5,20 +5,21 @@ any step does; it only knows how to start one, watch it emit, and decide what to
 raises.
 
 The Phase 1 pipeline does real work: validate the request, ask GitHub about the repository,
-clone it, and inspect what was cloned. The agent steps arrive later and are appended to the
-same list:
+clone it, and inspect what was cloned. The agent steps were appended to the same list as each
+phase landed:
 
-    validate -> resolve -> clone -> inspect -> plan -> modify -> test -> diagnose -> pull request
+    validate -> resolve -> clone -> inspect -> profile -> select_files -> plan -> apply_plan
 
-Everything those later steps need is already in place:
+Testing the result (2C) and opening the pull request (2D) are still to come. Everything those
+later steps need is already in place:
 
 * :class:`StepContext` carries the run, settings, the store, the workspace, a run-scoped
   ``state`` dict for passing results forward, and a bound ``emit`` coroutine.
 * :class:`StepOutcome` separates ``ok`` from ``retry`` from ``abort``, and ``Run.attempts``
   counts retries, so the fix loop becomes engine policy instead of a rewrite.
-* :class:`RunServices` is the container for the LLM client, the shell sandbox, and the diff
-  writer when they arrive. Steps take collaborators from here, never by importing them, which
-  is what keeps them substitutable in tests.
+* :class:`RunServices` is the container for the LLM client and, later, the shell sandbox. Steps
+  take collaborators from here, never by importing them, which is what keeps them substitutable
+  in tests.
 """
 
 from __future__ import annotations
@@ -36,10 +37,19 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
+from repopilot.agent.implement import (
+    ChangeRejectedError,
+    UnsafePathError,
+    generate_file_change,
+    read_for_edit,
+    resolve_write_target,
+    write_file,
+)
 from repopilot.agent.llm import ChatClient, LLMError, LLMNotConfiguredError
 from repopilot.agent.plan import PlanRejectedError, generate_plan
+from repopilot.agent.schema import FileSelection, ImplementationPlan
 from repopilot.analysis.profile import (
     IGNORED_DIRECTORIES as _IGNORED_DIRECTORIES,
 )
@@ -63,6 +73,7 @@ from repopilot.github.client import GitHubClient, RepositoryInfo
 __all__ = [
     "IGNORED_DIRECTORIES",
     "IGNORED_SUFFIXES",
+    "ApplyImplementationPlanStep",
     "BuildRepositoryProfileStep",
     "CloneRepositoryStep",
     "CreateImplementationPlanStep",
@@ -824,11 +835,289 @@ class CreateImplementationPlanStep(Step):
         return StepOutcome.OK
 
 
-def default_pipeline() -> tuple[Step, ...]:
-    """The default pipeline: Phase 1's four steps followed by Phase 2A discovery and planning.
+@dataclass(slots=True)
+class _FileAttempt:
+    """What happened to one planned file: written, deliberately skipped, or failed."""
 
-    Phase 2A is additive, so the four Phase 1 steps still run first and still mean what they
-    meant. Steps that write code (2B) and run tests (2C) are appended here when they exist.
+    status: Literal["written", "skipped", "failed"]
+    reason: str = ""
+    payload: dict[str, Any] | None = None
+
+
+class ApplyImplementationPlanStep(Step):
+    """Write the plan into the run's checkout: a branch, then one file at a time.
+
+    Every file the plan marks ``modify`` or ``add`` is generated and written; ``read`` files are
+    left alone, because reading them is not the same as being asked to change them. The model is
+    asked for one file per call so that a reply too large to finish, or wrong about one file,
+    costs that file alone.
+
+    Nothing here touches a file the run was not given. Paths are re-checked against the
+    checkout on the way in (:func:`~repopilot.agent.implement.resolve_write_target`), the branch
+    is created inside the run's own clone, and a path the plan never proposed cannot be written
+    at all. The changes are left uncommitted on the branch: Phase 2C runs the tests against this
+    working tree, and Phase 2D opens the pull request.
+    """
+
+    name = "apply_plan"
+    title = "Apply implementation plan"
+
+    async def execute(self, ctx: StepContext) -> StepOutcome:
+        client = ctx.services.llm
+        if client is None:
+            raise StepFailed(
+                "no reasoning backend is configured, so the plan cannot be applied. Set "
+                "REPOPILOT_LLM_MODEL and REPOPILOT_LLM_BASE_URL (plus REPOPILOT_LLM_API_KEY for "
+                "hosted providers) in .env, or start a local OpenAI-compatible server."
+            )
+
+        plan: ImplementationPlan | None = ctx.state.get("plan")
+        if plan is None:
+            raise StepFailed("no implementation plan; the plan step must run first")
+
+        root = ctx.local_path()
+        if not root.is_dir():
+            raise StepFailed(f"{root} does not exist; the clone step must run first")
+
+        targets = _writable_selections(plan)
+        branch = await self._create_branch(ctx, root)
+
+        await ctx.emit(
+            EventType.STEP_STARTED,
+            f"Applying {len(targets)} planned change(s) to {branch}"
+            if targets
+            else f"Nothing to apply; the plan proposed no file changes on {branch}",
+            data={"branch": branch, "files": len(targets), "workspace": str(root)},
+        )
+
+        if not targets:
+            await ctx.emit(
+                EventType.LOG,
+                "The plan names no file to change, so no file was written",
+                level=EventLevel.WARN,
+                data={"files_to_change": []},
+            )
+            await ctx.emit(
+                EventType.STEP_COMPLETED,
+                "No file changes to apply",
+                data={"branch": branch, "written": [], "skipped": [], "failed": []},
+            )
+            return StepOutcome.OK
+
+        written: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+        failed: list[dict[str, str]] = []
+
+        for index, selection in enumerate(targets):
+            if ctx.is_cancelled():
+                # The engine finalised the run when cancellation was requested, so returning
+                # here leaves the run cancelled instead of overwriting that with a failure.
+                await ctx.emit(
+                    EventType.LOG,
+                    f"Stopped after {len(written)} of {len(targets)} file(s): the run was "
+                    "cancelled",
+                    level=EventLevel.WARN,
+                    data={"written": len(written), "total": len(targets)},
+                )
+                return StepOutcome.OK
+
+            path = selection.path
+            await ctx.emit(
+                EventType.STEP_PROGRESS,
+                f"Writing {path} ({index + 1} of {len(targets)})",
+                progress=index / len(targets),
+                data={
+                    "path": path,
+                    "role": selection.role,
+                    "index": index + 1,
+                    "total": len(targets),
+                },
+            )
+
+            attempt = await self._write_one(ctx, root, plan, selection, branch, index, targets)
+            if attempt.payload is not None:
+                written.append(attempt.payload)
+            elif attempt.status == "skipped":
+                skipped.append({"path": path, "reason": attempt.reason})
+            else:
+                failed.append({"path": path, "reason": attempt.reason})
+
+        for problem in skipped:
+            await ctx.emit(
+                EventType.LOG,
+                f"Left {problem['path']} alone: {problem['reason']}",
+                level=EventLevel.WARN,
+                data=problem,
+            )
+        for problem in failed:
+            await ctx.emit(
+                EventType.LOG,
+                f"Could not write {problem['path']}: {problem['reason']}",
+                level=EventLevel.ERROR,
+                data=problem,
+            )
+
+        if not written:
+            raise StepFailed(
+                f"no planned file could be written ({len(failed)} rejected, {len(skipped)} "
+                "refused); the workspace is unchanged"
+            )
+
+        await ctx.emit(
+            EventType.STEP_COMPLETED,
+            f"Wrote {len(written)} of {len(targets)} planned file(s) on {branch}",
+            data={
+                "branch": branch,
+                "written": written,
+                "skipped": skipped,
+                "failed": failed,
+                "workspace": str(root),
+            },
+        )
+        return StepOutcome.OK
+
+    async def _write_one(
+        self,
+        ctx: StepContext,
+        root: Path,
+        plan: ImplementationPlan,
+        selection: FileSelection,
+        branch: str,
+        index: int,
+        targets: list[FileSelection],
+    ) -> _FileAttempt:
+        """Generate and write one planned file, reporting what happened to it.
+
+        A failure on one file is recorded and the run moves on to the next: a plan that touches
+        six files should not be thrown away because the fourth one was refused. The step only
+        fails outright when nothing at all could be written, so a run never claims to have
+        applied a plan it did not.
+        """
+        client = ctx.services.llm
+        assert client is not None  # the caller checked this
+        path = selection.path
+
+        try:
+            target = resolve_write_target(root, path)
+        except UnsafePathError as exc:
+            return _FileAttempt(status="skipped", reason=str(exc))
+
+        exists = target.is_file()
+        if selection.role == "modify" and not exists:
+            return _FileAttempt(
+                status="skipped",
+                reason="the plan says to modify it, but it is not in the checkout",
+            )
+
+        current = read_for_edit(root, path) or ""
+        if selection.role == "modify" and not current:
+            return _FileAttempt(
+                status="skipped",
+                reason=(
+                    f"it is {target.stat().st_size} bytes, too large to rewrite safely"
+                    if exists
+                    else "it could not be read from the checkout"
+                ),
+            )
+
+        siblings = [other.path for other in targets if other.path != path]
+        try:
+            change = await generate_file_change(
+                client,
+                task=ctx.run.task,
+                repository=ctx.run.repository.slug,
+                plan=plan,
+                path=path,
+                role=selection.role,
+                current=current,
+                siblings=siblings,
+            )
+        except ChangeRejectedError as exc:
+            return _FileAttempt(status="failed", reason=str(exc))
+        except LLMError as exc:
+            return _FileAttempt(status="failed", reason=f"reasoning backend failed: {exc}")
+
+        if current and change.content == current:
+            return _FileAttempt(
+                status="skipped", reason="the model returned it unchanged, so nothing was written"
+            )
+
+        try:
+            result = await asyncio.to_thread(write_file, root, path, change.content)
+        except (OSError, UnsafePathError) as exc:
+            return _FileAttempt(status="failed", reason=f"could not write it: {exc}")
+
+        payload = {
+            **change.as_dict(),
+            "created": result.created,
+            "branch": branch,
+            "workspace": str(root),
+            "index": index + 1,
+            "total": len(targets),
+        }
+        await ctx.emit(
+            EventType.FILE_WRITTEN,
+            f"{'Created' if result.created else 'Rewrote'} {result.path} "
+            f"({result.lines} lines, {result.bytes} bytes)",
+            progress=(index + 1) / len(targets),
+            data=payload,
+        )
+        ctx.state.setdefault("written", []).append(payload)
+        return _FileAttempt(status="written", payload=payload)
+
+    async def _create_branch(self, ctx: StepContext, root: Path) -> str:
+        """Check out this run's branch inside its own clone and report where it started."""
+        branch = ctx.run.branch or f"repopilot/{ctx.run.id}"
+        base = await _git_head(root)
+        exists = await _run_git(
+            "-C", str(root), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"
+        )
+        # ``checkout -b`` fails on a branch that is already there, which is what a retried run
+        # sees. Checking first keeps the step idempotent instead of turning a retry into a
+        # failure about branch names.
+        args = ("checkout", branch) if exists.returncode == 0 else ("checkout", "-b", branch)
+        result = await _run_git("-C", str(root), *args)
+        if result.returncode != 0:
+            raise StepFailed(
+                f"git {' '.join(args)} failed in {root}: {_tail(result.stderr)}", retryable=True
+            )
+
+        ctx.state["branch"] = branch
+        await ctx.emit(
+            EventType.BRANCH_CREATED,
+            f"Created branch {branch} at {(base or '?')[:8]}",
+            data={
+                "branch": branch,
+                "base": ctx.state.get("default_branch"),
+                "head": base,
+                "workspace": str(root),
+            },
+        )
+        return branch
+
+
+def _writable_selections(plan: ImplementationPlan) -> list[FileSelection]:
+    """The plan's files to write, in plan order and without repeats.
+
+    ``read`` is excluded because the plan marked those as context, not as work. The first role
+    wins for a repeated path, which keeps a plan that marks the same file ``add`` and
+    ``modify`` from writing it twice.
+    """
+    ordered: list[FileSelection] = []
+    seen: set[str] = set()
+    for selection in plan.relevant_files:
+        if selection.role not in ("modify", "add") or selection.path in seen:
+            continue
+        seen.add(selection.path)
+        ordered.append(selection)
+    return ordered
+
+
+def default_pipeline() -> tuple[Step, ...]:
+    """The default pipeline: Phase 1's four steps, then Phase 2A's and Phase 2B's.
+
+    Phase 2A and 2B are additive, so the four Phase 1 steps still run first and still mean what
+    they meant. The step that runs the test suite (2C) is appended here when it exists.
     """
     return (
         ValidateRequestStep(),
@@ -838,4 +1127,5 @@ def default_pipeline() -> tuple[Step, ...]:
         BuildRepositoryProfileStep(),
         SelectRelevantFilesStep(),
         CreateImplementationPlanStep(),
+        ApplyImplementationPlanStep(),
     )

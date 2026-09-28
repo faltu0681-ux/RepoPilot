@@ -92,3 +92,40 @@ class ImplementationPlan(BaseModel):
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
         }
+
+
+class FileChange(BaseModel):
+    """The new contents of one file the plan asked for, validated but not yet written.
+
+    Phase 2B asks the model for one file at a time, so the path and role are decided by the
+    run rather than by the reply: the model is only ever asked for the body. That keeps a
+    hallucinated path from turning into a file, because there is no path in the reply to
+    hallucinate.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    role: Literal["modify", "add"]
+    content: str
+
+    @property
+    def byte_size(self) -> int:
+        return len(self.content.encode("utf-8"))
+
+    @property
+    def line_count(self) -> int:
+        return len(self.content.splitlines())
+
+    def as_dict(self) -> dict[str, Any]:
+        """The metadata an event may carry.
+
+        Deliberately not the file body: events are persisted, replayed to every connected
+        client, and kept for the life of the run, so a source file has no business in one.
+        """
+        return {
+            "path": self.path,
+            "role": self.role,
+            "bytes": self.byte_size,
+            "lines": self.line_count,
+        }

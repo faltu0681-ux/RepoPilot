@@ -235,6 +235,7 @@ class TestPipelineShape:
             "profile",
             "select_files",
             "plan",
+            "apply_plan",
         ]
 
     def test_phase_one_steps_come_first(self) -> None:
@@ -850,6 +851,7 @@ class TestEngineLifecycle:
             "profile",
             "select_files",
             "plan",
+            "apply_plan",
         ]
 
         await engine.shutdown()

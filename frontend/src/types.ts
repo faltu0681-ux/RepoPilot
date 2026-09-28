@@ -29,6 +29,8 @@ export type EventType =
   | 'log'
   | 'file.selected'
   | 'plan.created'
+  | 'branch.created'
+  | 'file.written'
 
 export type EventLevel = 'debug' | 'info' | 'warn' | 'error'
 
@@ -71,6 +73,16 @@ export interface ImplementationPlan {
   model: string
   prompt_tokens: number | null
   completion_tokens: number | null
+}
+
+/** One entry of the `file.written` event, which reports a file without carrying its body. */
+export interface WrittenFile {
+  path: string
+  role: FileRole
+  bytes: number
+  lines: number
+  created: boolean
+  branch: string | null
 }
 
 export interface ExecutionEvent {

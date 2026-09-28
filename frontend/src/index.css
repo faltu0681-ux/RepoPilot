@@ -434,6 +434,15 @@ button.ghost {
   color: var(--warn);
 }
 
+/* The written-files list reuses the score column to say new or edit, not a score. */
+.changes .score {
+  color: var(--muted);
+}
+
+.changes .score.new {
+  color: var(--ok);
+}
+
 .role {
   flex: none;
   min-width: 48px;
