@@ -31,11 +31,13 @@ repopilot = "repopilot.cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# The importable package lives under apps/api, so the wheel is assembled from there rather than
+# from a top-level ``backend`` directory that no longer exists.
 [tool.hatch.build.targets.wheel]
-packages = ["backend/repopilot"]
+packages = ["apps/api/repopilot"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["apps/api/tests"]
 asyncio_mode = "auto"
 # A WebSocket read that blocks forever should fail the test, not hang the suite.
 timeout = 60
@@ -44,7 +46,7 @@ filterwarnings = ["error::DeprecationWarning:repopilot.*"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["backend", "tests"]
+src = ["apps/api", "apps/api/tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]

@@ -1,0 +1,24 @@
+# Normalise line endings in the repository, and check them out as LF everywhere.
+#
+# This repo is developed on Windows with PowerShell, whose cmdlets write CRLF by default, while
+# every committed file is LF. Without this, a file written by a script shows up as changed on every
+# single line, and `git diff --check` reports every line as trailing whitespace because the carriage
+# returns are invisible to the reader.
+#
+# `text=auto` lets git decide from the content, so binary fixtures stay binary; `eol=lf` is what
+# keeps the working tree LF too, which is the part that stops the CRLF from reappearing on the next
+# script-written file.
+* text=auto eol=lf
+
+# Generated or vendored, and not ours to normalise.
+node_modules/** -text
+**/dist/** -text
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# Windows cannot exec a .py directly under Popen(shell=False), so the docker test fake uses a .cmd
+# shim. CRLF is what cmd.exe expects in a batch file.
+*.cmd text eol=crlf

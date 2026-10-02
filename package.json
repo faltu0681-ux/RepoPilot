@@ -1,0 +1,28 @@
+{
+  "name": "repopilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "RepoPilot monorepo: a FastAPI agent service, a React terminal UI, and the wire contract they share.",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "apps/web",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+
+    "build": "npm run build --workspace @repopilot/contracts && npm run build --workspace @repopilot/web",
+    "lint": "npm run lint --workspace @repopilot/web",
+    "typecheck": "npm run typecheck --workspace @repopilot/contracts && npm run typecheck --workspace @repopilot/web",
+
+    "api:serve": "python -m repopilot.cli serve",
+    "api:test": "python -m pytest",
+    "api:lint": "python -m ruff check apps/api",
+    "api:format": "python -m ruff format apps/api",
+
+    "check": "npm run lint && npm run typecheck && npm run api:lint && npm run api:test"
+  }
+}

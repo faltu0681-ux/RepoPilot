@@ -1,14 +1,17 @@
 # RepoPilot
 
-An autonomous coding agent. Point it at a GitHub repository and a task; RepoPilot clones the
-repo, analyses it, plans the change, applies the change, runs the tests, diagnoses failures,
-retries, and opens a pull request.
+An autonomous coding agent. Point it at a repository and a task; RepoPilot clones the repo,
+analyses it, plans the change, applies the change, runs the tests, diagnoses failures, retries,
+and opens a pull request.
 
 RepoPilot streams everything it does as live events, so you watch the agent work in a terminal.
 
 ```
 GitHub repo -> Create Run -> Execution state -> Live events -> WebSocket -> Terminal UI
 ```
+
+A repository can be one on GitHub (`owner/name`) or one already on this machine
+(`local://your-folder`). A local run works on its own copy, so your files are untouched afterwards.
 
 ## Status
 
@@ -18,11 +21,30 @@ declares, executes it in the run's checkout, reports the verdict live, and when 
 asks the model what broke and repairs up to two times, re-running the suite after each repair.
 A failure it cannot explain ends the run with the reason instead of a silent retry loop.
 
-Nothing is committed and no pull request is opened (2D), so a run ends with changes and a
-verdict, sitting uncommitted on its branch.
+**Phase 2D - reporting on the run.** A run now commits its own change, proposes it, and says
+plainly what it proved. The commit is made in the run's own clone after the suite has judged it,
+with a message that names the task and records the verdict in the body. A GitHub repository with a
+token configured gets a real push and a real pull request. Every run ends with a structured
+summary on `Run.summary`, carrying one of three verdicts: `verified` (a suite passed), `failed`
+(a suite ran and did not pass), or `unverified` (no suite ran, so nothing is claimed either way).
+
+A run that cannot commit, cannot push, or has no token says which of those it was rather than
+failing or pretending. A `local://` folder is the user's own code on this machine, so it is
+committed in the run's private copy and no pull request is attempted.
 
     validate -> resolve -> clone -> inspect -> profile -> select_files -> plan -> apply_plan
-    -> test -> diagnose
+    -> test -> diagnose -> commit -> pull_request -> summarise
+
+**V1 - executing untrusted code behind a boundary.** Everything above runs the target repository's
+test suite, which is the first thing in this project that executes code nobody reviewed. That used
+to happen in a child process on the host, with a working directory and a filtered environment and
+nothing else. There is now an `ExecutionEnvironment` interface with two backends behind it: the
+existing `local` one, and a `docker` one that runs each command in a throwaway container with only
+the run's own checkout mounted, no network, and CPU, memory and process caps. The engine does not
+know which is in use, and every run announces which one it used. `REPOPILOT_EXECUTION_BACKEND`
+chooses; `local` remains the default so a fresh clone works without Docker. The honest limits of
+that boundary, including what Docker does not protect you from, are in
+[`docs/architecture.md`](docs/architecture.md).
 
 | Milestone | What it adds | Status |
 | --- | --- | --- |
@@ -39,7 +61,7 @@ verdict, sitting uncommitted on its branch.
 | 11 | Plan and discovered files in the terminal UI | done |
 | 12 | Edit files on a branch in the run workspace (2B) | done |
 | 13 | Test detection, execution, failure diagnosis, retry (2C) | done |
-| 14 | Structured run summary with VERIFIED / FAILED (2D) | next |
+| 14 | Commit, pull request, structured run summary with VERIFIED / FAILED / UNVERIFIED (2D) | done |
 
 Every seam the rest of the agent needs already exists: `StepOutcome.RETRY` plus `Run.attempts`
 is the fix loop, `RunServices` is where the sandbox goes, and each agent capability is one more
@@ -50,6 +72,26 @@ entry in `default_pipeline()`.
 - Python 3.11+
 - Node.js 20+ (for the terminal UI)
 
+## Layout
+
+```
+apps/
+  api/repopilot/     FastAPI service (Python package)
+  api/tests/         pytest suite
+  web/               React + Vite terminal UI
+packages/
+  contracts/         TypeScript wire types mirroring the Python models
+docs/
+  architecture.md    How V1 works, its threat model, and what V2 defers
+scripts/dev.mjs      Runs the API and the web app together
+workspaces/          Folders you can point runs at with local://  (gitignored)
+```
+
+npm workspaces cover the Node side (`apps/web` and `packages/*`); the Python side stays a normal
+pip package with its own virtualenv. There is no task runner. `scripts/dev.mjs` is
+dependency-free, and a dependency would earn its place only by doing more than starting two
+processes and stopping both together.
+
 ## Getting started
 
 ```bash
@@ -58,23 +100,33 @@ python -m venv .venv
 # source .venv/bin/activate   # macOS / Linux
 
 pip install -e ".[dev]"
+npm install
 ```
 
-Run the backend:
+Then, to run the API and the UI together in one terminal:
+
+```bash
+npm run dev
+```
+
+The API is then on <http://localhost:8000>, with docs at <http://localhost:8000/docs>, and the UI
+on <http://localhost:5173>. Stopping that one command stops both, including the uvicorn reloader
+and the Vite child it spawned.
+
+To run only the backend:
 
 ```bash
 repopilot serve
 ```
 
-The API is then on <http://localhost:8000>, with docs at <http://localhost:8000/docs>.
-
-Use this rather than a bare `uvicorn --reload`. The run workspace defaults to
-`./.repopilot-data`, inside the project, and a run clones a whole repository into it. A bare
-`--reload` watches the project, sees those cloned `.py` files, and restarts the server in the
-middle of the run that is writing them, which cancels the run and loses its events.
-`repopilot serve` derives the exclusion from `REPOPILOT_WORKSPACE_DIR` and prunes that directory
-from the watch, so reload works and runs survive. `repopilot serve --no-reload` runs a single
-process.
+Prefer this rather than a bare `uvicorn --reload`. Two directories under the project hold other
+people's code: the run workspace (`./.repopilot-data`), where a run clones a repository, and the
+repositories directory (`./workspaces`), where you drop folders to be worked on. Repositories are
+mostly `.py` files, so a bare `--reload` watches the project, sees those files, and restarts the
+server in the middle of the run that is writing them, which cancels the run and loses its events.
+`repopilot serve` derives both exclusions from `REPOPILOT_WORKSPACE_DIR` and
+`REPOPILOT_REPOSITORIES_DIR` and prunes those directories from the watch, so reload works and runs
+survive. `repopilot serve --no-reload` runs a single process.
 
 Run the tests:
 
@@ -107,10 +159,39 @@ curl http://127.0.0.1:8000/api/runs/<run_id>/events
 | --- | --- |
 | `POST /api/runs` | Create a run and start the pipeline |
 | `GET /api/runs` | List runs, newest first (`?status=`, `?limit=`) |
+| `GET /api/runs/repositories` | Folders available as `local://` references |
 | `GET /api/runs/{id}` | Current state of one run |
 | `GET /api/runs/{id}/events` | Full event history, with an `?after_sequence=` cursor |
 | `DELETE /api/runs/{id}` | Cancel an in-flight run |
 | `WS /ws/events` | Live event stream |
+
+## Working on a local repository
+
+Not every repository you want changed is on GitHub. Drop a folder into `workspaces/`:
+
+```
+workspaces/
+├── project-a/
+└── project-c/
+```
+
+and start a run against `local://project-a`. Everything downstream is unchanged: the run resolves,
+copies, inspects, profiles, plans, edits, and tests exactly as it would for a cloned repository.
+
+Two details make this safe:
+
+- **Your folder is never written to.** The run copies the folder into its own checkout under
+  `REPOPILOT_WORKSPACE_DIR` and works on that. Two runs of one folder get two separate copies, and
+  the plan, edit, and repair steps can only reach the copy. The copy keeps your `.git`, so your
+  branches and history come with it; a folder that is not a checkout gets one initialised, because
+  the run creates a branch to work on.
+- **The name is a single path segment.** `local://<name>` refers to exactly one direct child of the
+  repositories directory, validated to a name that is legal as a directory on Windows as well as
+  POSIX and checked for containment after resolving. `local://../anything` is not a repository.
+
+`GET /api/runs/repositories` lists what is actually on disk, which is what the UI offers as
+one-click buttons. The UI reads it once on load; it is a convenience, so the repository field
+still accepts anything you type.
 
 ## Watching a run live
 
@@ -170,16 +251,62 @@ in the project root. See `.env.example`.
 | `REPOPILOT_HOST` | `127.0.0.1` | Bind address for the API |
 | `REPOPILOT_PORT` | `8000` | Bind port for the API |
 | `REPOPILOT_GITHUB_TOKEN` | _unset_ | Token used to clone private repos and open PRs |
-| `REPOPILOT_WORKSPACE_DIR` | `./.repopilot-data` | Where repositories are cloned |
+| `REPOPILOT_WORKSPACE_DIR` | `./.repopilot-data` | Where each run's checkout is created |
+| `REPOPILOT_REPOSITORIES_DIR` | `./workspaces` | Where the folders `local://` refers to live |
 | `REPOPILOT_CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed frontend origins |
 | `REPOPILOT_LLM_API_KEY` | _unset_ | Key for the reasoning backend. Not needed for local runtimes |
 | `REPOPILOT_LLM_BASE_URL` | _empty_ | Provider endpoint. Empty means "no reasoning backend" |
 | `REPOPILOT_LLM_MODEL` | _empty_ | Model name. Empty means "no reasoning backend" |
 | `REPOPILOT_LLM_DIALECT` | `openai` | `openai` for any OpenAI-compatible API, or `anthropic` |
 | `REPOPILOT_TEST_TIMEOUT_SECONDS` | `600` | Wall-clock limit for one test suite run. `0 < value <= 7200` |
+| `REPOPILOT_EXECUTION_BACKEND` | `local` | Where untrusted commands run: `local` or `docker`. See below |
+| `REPOPILOT_SANDBOX_IMAGE` | `python:3.12-slim` | Image commands run in, for the `docker` backend |
+| `REPOPILOT_SANDBOX_NETWORK` | `none` | Container network mode. Keep it `none` unless you mean it |
+| `REPOPILOT_SANDBOX_MEMORY` | `2g` | Container memory limit |
+| `REPOPILOT_SANDBOX_CPUS` | `2` | Container CPU limit |
+| `REPOPILOT_SANDBOX_PIDS_LIMIT` | `512` | Container process limit |
+| `REPOPILOT_SANDBOX_USER` | _empty_ | Container user. Empty means the image's own |
 
 **`.env` is gitignored and must never be committed.** No tokens, keys, or credentials belong
 in this repository. If you add a secret-handling path later, read it from the environment only.
+
+### Where the agent's code executes
+
+RepoPilot runs code it did not write: a target repository's test suite, and whatever the model
+asks for while repairing a failure. `REPOPILOT_EXECUTION_BACKEND` decides where that happens.
+
+|  | `local` (default) | `docker` |
+| --- | --- | --- |
+| Process | child process on this host | throwaway container per command |
+| Filesystem beyond the run's checkout | **accessible** | not mounted |
+| Network | **unrestricted** | `none` by default |
+| CPU / memory / processes | **unlimited** | capped |
+| Privilege escalation | not prevented | refused |
+| Needs | nothing | Docker installed |
+
+`local` is the default so a fresh clone can run a test without Docker. It confines a command to the
+run's workspace directory and strips `REPOPILOT_*` from its environment, and that is all it does.
+**It is not a sandbox.** The UI says which one a run used.
+
+`docker` mounts exactly one path — this run's checkout — and asks the runtime for no network, no
+privilege escalation, no Linux capabilities, and hard caps on memory, CPU and process count. No
+`REPOPILOT_*` variable is ever forwarded in: the GitHub token stays in RepoPilot's own process, where
+the push happens, and the code under test cannot read it.
+
+```bash
+REPOPILOT_EXECUTION_BACKEND=docker
+REPOPILOT_SANDBOX_IMAGE=python:3.12-slim   # pick one that matches the repository's stack
+```
+
+A container is **not** a complete security boundary, and the honest limits are in
+[`docs/architecture.md`](docs/architecture.md) — anyone with Docker access effectively has root on
+the host, a runtime vulnerability defeats all of it, and the image you choose is trusted input. The
+container backend protects a developer running RepoPilot against a repository they do not fully
+trust. It is not a multi-tenant hosting boundary.
+
+Both backends implement one interface (`execution/environment.py`), so the agent engine does not know
+which is in use. Kubernetes, when it is ever needed, is a third implementation of the same
+interface.
 
 ### Configuring the reasoning backend
 
@@ -214,11 +341,22 @@ Every run gets its own checkout, named after the run:
 
 ```
 .repopilot-data/<owner>__<repo>/<run_id>/
+.repopilot-data/local__<folder>/<run_id>/     # for a local:// run
 ```
 
 Two runs of the same repository therefore cannot see each other's work, and a run never touches
 a checkout you made yourself. Nothing outside `REPOPILOT_WORKSPACE_DIR` is written, and file
 reads are checked for containment before use.
+
+### The repository workspaces
+
+`REPOPILOT_REPOSITORIES_DIR` defaults to `./workspaces` and holds your own folders, one
+repository per directory. It is gitignored, because its contents are your code rather than
+RepoPilot's; only its README is tracked, so the directory exists in a fresh clone. Point the
+variable anywhere else to keep it outside the project.
+
+Nothing here is written to. A local run reads the folder and copies it into
+`REPOPILOT_WORKSPACE_DIR`, and the pipeline works on the copy from there on.
 
 ## Terminal UI
 
@@ -226,14 +364,16 @@ The Vite dev server runs on <http://localhost:5173> and proxies both `/api` and 
 backend, so the browser talks to one origin and there is no CORS preflight.
 
 ```bash
-cd frontend
-npm install
 npm run dev
 ```
 
-Start the backend first, then open the page, enter a repository and a task, and press **Start run**.
+`npm run dev` starts the backend too, so this is only needed if the API is already running
+elsewhere. Start it, then open the page, enter a repository and a task, and press **Start run**.
 Events stream in live and the panel follows the tail until you scroll up, at which point it stops
 chasing so you can read.
+
+If `workspaces/` holds any folders, they appear above the terminal as one-click buttons that fill
+the repository field with `local://<name>`.
 
 Below the terminal, three panels fill in as the run works, and all of them are derived purely
 from the event stream, so a reconnecting browser rebuilds them from the replayed events alone:
@@ -264,7 +404,7 @@ npm run build     # tsc -b && vite build
 
 ### How the client uses the stream
 
-`frontend/src/useRunStream.ts` holds the three things that make an at-any-time attach work:
+`apps/web/src/useRunStream.ts` holds the three things that make an at-any-time attach work:
 
 - the cursor advances with the highest sequence seen and is sent as `after_sequence` on every
   reconnect, so a flaky connection never re-renders what is already on screen;
@@ -282,26 +422,32 @@ the point to swap in a real terminal.
 ## Architecture
 
 ```
-backend/repopilot/
+apps/api/repopilot/
   main.py          FastAPI app factory, lifespan, router wiring
   config.py        Environment-based settings
-  domain/          Pure data: Run, RunStatus, ExecutionEvent, RunEventType
+  cli.py           `repopilot serve`
+  domain/          Pure data: Run, RunStatus, ExecutionEvent, RepositoryRef
   execution/       Engine, event bus, step pipeline (the pluggable agent seam)
   analysis/        Deterministic repo inspection: profile.py, relevance.py, testing.py
   agent/           Model-driven reasoning: llm.py, prompts.py, plan.py, implement.py, diagnose.py
   github/          GitHub client (repo metadata, clone, PR creation)
   api/             HTTP routes and the WebSocket endpoint
-frontend/
-  src/types.ts     Wire types mirroring the backend frames
+apps/api/tests/    pytest suite
+apps/web/
   src/api.ts       REST client
   src/useRunStream.ts  WebSocket subscription: cursor, resync, reconnect
   src/App.tsx      Form, live terminal, discovered files, plan, changes and verification panels
-tests/             pytest suite
+packages/contracts/
+  src/index.ts     Wire types mirroring the backend frames
 ```
 
 The dependency direction is one-way: `api` -> `execution` -> `agent`/`analysis` -> `domain`.
 `domain` imports nothing from the project. That is what keeps the rest of the agent addable
 without refactoring.
+
+`packages/contracts` is a hand-maintained mirror of the Python models, not generated from them.
+Python stays the single source of truth; the mirror keeps the frontend from importing across the
+workspace boundary at build time. When a frame changes, both copies change.
 
 ### Analysis versus reasoning
 

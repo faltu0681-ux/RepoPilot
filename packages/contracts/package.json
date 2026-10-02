@@ -1,0 +1,23 @@
+{
+  "name": "@repopilot/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript types mirroring the RepoPilot API. Python is the source of truth.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.2"
+  }
+}

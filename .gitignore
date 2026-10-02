@@ -41,8 +41,8 @@ htmlcov/
 
 # ---- Node / frontend ----
 node_modules/
-frontend/dist/
-frontend/build/
+dist/
+build/
 .vite/
 npm-debug.log*
 yarn-error.log*
@@ -60,7 +60,17 @@ desktop.ini
 
 # ---- Repopilot runtime artefacts ----
 # Cloned repositories, run logs, and anything the engine writes to disk.
+# Each run gets an isolated checkout here: <workspace_dir>/<owner>__<repo>/<run_id>
 .repopilot-data/
 repopilot-data/
 .runs/
 *.log
+
+# ---- Repository workspaces (Phase 4) ----
+# Repositories the user drops in for RepoPilot to work on. The application source lives in apps/
+# and packages/, so nothing here can shadow it.
+#
+# Only the README is tracked, so the directory exists in a fresh clone: an empty directory is not
+# something git can hold on to.
+workspaces/*
+!workspaces/README.md
