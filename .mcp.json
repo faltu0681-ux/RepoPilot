@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "glyph": {
+      "url": "http://localhost:3002/mcp",
+      "headers": { "Authorization": "Bearer ctx_live_<MCP_KEY>" }
+    }
+  }
+}
